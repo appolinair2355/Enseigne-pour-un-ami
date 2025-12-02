@@ -1,39 +1,56 @@
 import os
+import sys
 
-# --- 1. CONFIGURATION OBLIGATOIRE DU BOT TELEGRAM ---
-# REMPLACEZ TOUTES LES VALEURS ENTRE GUILLEMETS OU LE '0' PAR VOS PROPRES INFORMATIONS.
+# --- FONCTION UTILITAIRE POUR LA CONVERSION ---
+def get_env_var(name, default=None, is_int=False):
+    """Récupère une variable d'environnement et gère la conversion de type et les erreurs."""
+    value = os.getenv(name, default)
+    if value is None or value == "":
+        # Si la variable n'est pas trouvée (cas Render manquant), on laisse la valeur par défaut (souvent None)
+        return default
+        
+    if is_int:
+        try:
+            return int(value)
+        except ValueError:
+            # Si l'ID est fourni mais n'est pas un nombre, on affiche une erreur et s'arrête
+            print(f"FATAL ERROR: Environment variable '{name}' must be an integer.")
+            sys.exit(1)
+            
+    return value
 
-# 🔑 API ID (obtenu via my.telegram.org)
-API_ID = 0 # REMPLACER PAR VOTRE API ID (int)
+# --- 1. CONFIGURATION OBLIGATOIRE DU BOT TELEGRAM (Lue depuis l'environnement) ---
 
-# 🔑 API Hash (obtenu via my.telegram.org)
-API_HASH = "VOTRE_API_HASH" # REMPLACER PAR VOTRE API HASH (str)
+# 🔑 API ID : Récupération depuis l'environnement, doit être un entier
+API_ID = get_env_var("API_ID", default=0, is_int=True)
 
-# 🔑 Bot Token (obtenu via @BotFather)
-BOT_TOKEN = "VOTRE_BOT_TOKEN" # REMPLACER PAR VOTRE TOKEN (str)
+# 🔑 API Hash : Récupération depuis l'environnement
+API_HASH = get_env_var("API_HASH", default="")
 
-# 👑 ID de l'administrateur
+# 🔑 Bot Token : Récupération depuis l'environnement
+BOT_TOKEN = get_env_var("BOT_TOKEN", default="")
+
+# 👑 ID de l'administrateur (peut être lu depuis l'environnement ou fixé)
+# Si vous le fixez ici, il ne sera pas écrasé par l'environnement
 ADMIN_ID = 7196268478
 
 
-# --- 2. CONFIGURATION DES CANAUX ---
+# --- 2. CONFIGURATION DES CANAUX (Fixées ou lues) ---
 
-# ➡️ ID du canal SOURCE (où les messages sont lus)
+# ➡️ ID du canal SOURCE
 SOURCE_CHANNEL_ID = -1001003464313784 
 
-# ⬅️ ID du canal PRÉDICTION (où le bot envoie les prédictions)
+# ⬅️ ID du canal PRÉDICTION
 PREDICTION_CHANNEL_ID = -1003300736833
 
 # --- 3. CONFIGURATION DU SERVEUR WEB ---
-# Utilisé pour le déploiement.
+# Lit le port de l'environnement (essentiel pour Render)
 PORT = int(os.environ.get("PORT", 8080))
 
 # --- 4. CONFIGURATION DES COULEURS (Cartes) ---
 
-# Liste de toutes les couleurs (Pique, Trèfle, Carreau, Cœur)
 ALL_SUITS = ['♠', '♣', '♦', '♥']
 
-# Mappage pour l'affichage (non essentiel pour la logique actuelle, mais nécessaire pour l'import)
 SUIT_DISPLAY = {
     '♠': 'Pique', 
     '♣': 'Trèfle', 
@@ -41,5 +58,6 @@ SUIT_DISPLAY = {
     '♥': 'Cœur'
 }
 
-# Mappage de couleur (placeholder)
+# Mappage pour l'ancienne logique (à définir si besoin, sinon vide)
 SUIT_MAPPING = {} 
+    
