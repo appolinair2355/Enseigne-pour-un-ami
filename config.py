@@ -1,4 +1,4 @@
-yoimport os
+import os
 import sys
 
 # --- FONCTION UTILITAIRE POUR LA CONVERSION ---
