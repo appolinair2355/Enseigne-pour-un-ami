@@ -1,44 +1,45 @@
-"""
-Configuration du bot Telegram de prédiction Baccarat
-"""
 import os
 
-def parse_channel_id(env_var: str, default: str) -> int:
-    value = os.getenv(env_var) or default
-    channel_id = int(value)
-    if channel_id > 0 and len(str(channel_id)) >= 10:
-        channel_id = -channel_id
-    return channel_id
+# --- 1. CONFIGURATION OBLIGATOIRE DU BOT TELEGRAM ---
+# REMPLACEZ TOUTES LES VALEURS ENTRE GUILLEMETS OU LE '0' PAR VOS PROPRES INFORMATIONS.
 
-SOURCE_CHANNEL_ID = parse_channel_id('SOURCE_CHANNEL_ID', '-1002682552255')
+# 🔑 API ID (obtenu via my.telegram.org)
+API_ID = 0 # REMPLACER PAR VOTRE API ID (int)
 
-PREDICTION_CHANNEL_ID = parse_channel_id('PREDICTION_CHANNEL_ID', '-1002338377421')
+# 🔑 API Hash (obtenu via my.telegram.org)
+API_HASH = "VOTRE_API_HASH" # REMPLACER PAR VOTRE API HASH (str)
 
-ADMIN_ID = int(os.getenv('ADMIN_ID') or '0')
+# 🔑 Bot Token (obtenu via @BotFather)
+BOT_TOKEN = "VOTRE_BOT_TOKEN" # REMPLACER PAR VOTRE TOKEN (str)
 
-API_ID = int(os.getenv('API_ID') or '0')
-API_HASH = os.getenv('API_HASH') or ''
-BOT_TOKEN = os.getenv('BOT_TOKEN') or ''
+# 👑 ID de l'administrateur
+ADMIN_ID = 7196268478
 
-PORT = int(os.getenv('PORT') or '5000')  # Port 5000 for Replit
 
-SUIT_MAPPING = {
-    '♠️': '❤️',
-    '♠': '❤️',
-    '❤️': '♠️',
-    '❤': '♠️',
-    '♥️': '♠️',
-    '♥': '♠️',
-    '♣️': '♦️',
-    '♣': '♦️',
-    '♦️': '♣️',
-    '♦': '♣️'
-}
+# --- 2. CONFIGURATION DES CANAUX ---
 
-ALL_SUITS = ['♠', '♥', '♦', '♣']
+# ➡️ ID du canal SOURCE (où les messages sont lus)
+SOURCE_CHANNEL_ID = -1001003464313784 
+
+# ⬅️ ID du canal PRÉDICTION (où le bot envoie les prédictions)
+PREDICTION_CHANNEL_ID = -1003300736833
+
+# --- 3. CONFIGURATION DU SERVEUR WEB ---
+# Utilisé pour le déploiement.
+PORT = int(os.environ.get("PORT", 8080))
+
+# --- 4. CONFIGURATION DES COULEURS (Cartes) ---
+
+# Liste de toutes les couleurs (Pique, Trèfle, Carreau, Cœur)
+ALL_SUITS = ['♠', '♣', '♦', '♥']
+
+# Mappage pour l'affichage (non essentiel pour la logique actuelle, mais nécessaire pour l'import)
 SUIT_DISPLAY = {
-    '♠': '♠️',
-    '♥': '❤️',
-    '♦': '♦️',
-    '♣': '♣️'
+    '♠': 'Pique', 
+    '♣': 'Trèfle', 
+    '♦': 'Carreau', 
+    '♥': 'Cœur'
 }
+
+# Mappage de couleur (placeholder)
+SUIT_MAPPING = {} 
