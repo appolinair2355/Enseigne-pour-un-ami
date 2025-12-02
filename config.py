@@ -1,4 +1,4 @@
-import os
+yoimport os
 import sys
 
 # --- FONCTION UTILITAIRE POUR LA CONVERSION ---
@@ -32,7 +32,7 @@ BOT_TOKEN = get_env_var("BOT_TOKEN", default="")
 
 # 👑 ID de l'administrateur (peut être lu depuis l'environnement ou fixé)
 # Si vous le fixez ici, il ne sera pas écrasé par l'environnement
-ADMIN_ID = 7196268478
+ADMIN_ID = 1190237801
 
 
 # --- 2. CONFIGURATION DES CANAUX (Fixées ou lues) ---
