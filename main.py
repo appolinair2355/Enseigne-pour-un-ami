@@ -5,7 +5,7 @@ import logging
 import sys
 import zipfile
 import shutil
-import json # NOUVEAU
+import json
 from datetime import datetime, timedelta, timezone, time
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -14,7 +14,7 @@ from config import (
     API_ID, API_HASH, BOT_TOKEN, ADMIN_ID,
     SOURCE_CHANNEL_ID, PREDICTION_CHANNEL_ID, PORT,
     SUIT_MAPPING_EVEN, SUIT_MAPPING_ODD, ALL_SUITS, SUIT_DISPLAY, SUIT_NORMALIZE,
-    A_OFFSET_DEFAULT, R_OFFSET_DEFAULT, VERIFICATION_EMOJIS # NOUVEAU
+    A_OFFSET_DEFAULT, R_OFFSET_DEFAULT, VERIFICATION_EMOJIS
 )
 
 # --- Configuration et Initialisation ---
@@ -52,12 +52,11 @@ current_game_number = 0
 source_channel_ok = False
 prediction_channel_ok = False
 transfer_enabled = True
-# NOUVEAU: Offsets de configuration persistants
 A_OFFSET = A_OFFSET_DEFAULT
 R_OFFSET = R_OFFSET_DEFAULT
 CONFIG_FILE = 'bot_config.json'
 
-# --- NOUVEAU: Fonctions de Persistance ---
+# --- Fonctions de Persistance ---
 
 def load_config():
     """Charge la configuration depuis le fichier JSON."""
@@ -107,13 +106,15 @@ def extract_parentheses_groups(message: str):
     """Extrait le contenu entre parenthèses."""
     return re.findall(r"\(([^)]*)\)", message)
 
-def get_first_suit_in_group(group_str: str) -> str:
-    """Trouve la première couleur (suit) dans un groupe."""
-    suit_pattern = r'[♠♥♦♣]|♠️|♥️|♦️|♣️|❤️|❤'
-    match = re.search(suit_pattern, group_str)
-    if match:
-        return normalize_suit(match.group())
-    return None
+def is_odd(number: int) -> bool:
+    """Vérifie si un numéro est impair."""
+    return number % 2 != 0
+
+def is_message_finalized(message: str) -> bool:
+    """Vérifie si le message est un résultat final."""
+    if '⏰' in message:
+        return False
+    return '✅' in message or '🔰' in message
 
 def suit_in_group(group_str: str, target_suit: str) -> bool:
     """Vérifie si une couleur est présente dans un groupe."""
@@ -125,27 +126,92 @@ def suit_in_group(group_str: str, target_suit: str) -> bool:
             return True
     return False
 
-def is_odd(number: int) -> bool:
-    """Vérifie si un numéro est impair."""
-    return number % 2 != 0
+# --- NOUVEAU: Fonctions d'Extraction Avancée et de Logique de Carte ---
 
-def get_predicted_suit(base_suit: str, game_number: int) -> str:
+CARD_VALUES_ODD = {'A', '3', '5', '7', '9', 'J', 'K'}
+CARD_VALUES_EVEN = {'2', '4', '6', '8', 'T', '10', 'Q'} # 'T' pour Ten, '10' pour 10 (selon le format)
+
+def is_card_value_odd(card_value: str) -> bool:
+    """Détermine si la valeur de la carte est impaire (A, 3, 5, 7, 9, J, K)."""
+    # Normalisation pour '10' (qui est Pair)
+    normalized_value = card_value.upper().replace('10', 'T') 
+    return normalized_value in CARD_VALUES_ODD
+
+def extract_first_card_details(group_str: str):
+    """Extrait la valeur et la couleur de la première carte d'un groupe."""
+    # Valeurs possibles : A, 2-9, 10, T, J, Q, K
+    value_pattern = r'([A2-9JQKT]|10)?'
+    # Couleurs normalisées
+    suit_pattern = r'([♠♥♦♣]|♠️|♥️|♦️|♣️|❤️|❤)'
+    
+    match = re.search(value_pattern + suit_pattern, group_str, re.IGNORECASE)
+    
+    if match:
+        # group(1) = Valeur, group(2) = Couleur
+        value = match.group(1) if match.group(1) else ''
+        suit = normalize_suit(match.group(2))
+        return value, suit
+    return None, None
+
+def get_predicted_suit(base_suit: str, card_value: str, game_number: int) -> str:
     """
-    Applique la transformation selon le numéro de jeu:
-    - Jeux PAIRS: ♠️→♣️, ♣️→♠️, ♦️→♥️, ♥️→♦️
-    - Jeux IMPAIRS: ♠️→♥️, ♣️→♦️, ♦️→♣️, ♥️→♠️
+    Applique la transformation selon la nouvelle règle complexe:
+    - Base_suit: '♠', '♥', '♦', '♣' (normalisée)
+    - card_value: 'A', '2', '3', ... (ou None si non trouvé)
+    - game_number: N
     """
-    normalized = normalize_suit(base_suit)
-    if is_odd(game_number):
-        return SUIT_MAPPING_ODD.get(normalized, normalized)
+    normalized_suit = normalize_suit(base_suit)
+    is_odd_game = is_odd(game_number)
+    
+    # Si la valeur n'est pas trouvée, on suppose IMPAIRE pour éviter de casser la logique
+    is_value_odd = is_card_value_odd(card_value) if card_value else True 
+    
+    H = '♥' # Coeur
+    S = '♠' # Pique
+    D = '♦' # Carreau
+    C = '♣' # Trèfle
+    
+    # --- Jeux PAIRS (is_odd_game est False) ---
+    if not is_odd_game:
+        # 1. Enseigne : H ou S (❤️ ou ♠️)
+        if normalized_suit in [H, S]:
+            if not is_value_odd: # Valeur PAIRE (2, 4, 6, 8, 10, Q)
+                # ♠️ → ♣️ et ❤️ → ♦️
+                return {'♠': C, '♥': D}.get(normalized_suit, normalized_suit)
+            else: # Valeur IMPAIRE (A, 3, 5, 7, 9, J, K)
+                # ♠️ → ♠️ et ❤️ → ❤️ (Aucune transformation)
+                return normalized_suit
+        
+        # 2. Enseigne : D ou C (♦️ ou ♣️)
+        elif normalized_suit in [D, C]:
+            if not is_value_odd: # Valeur PAIRE (2, 4, 6, 8, 10, Q)
+                # ♦️ → ♠️ et ♣️ → ❤️
+                return {'♦': S, '♣': H}.get(normalized_suit, normalized_suit)
+            else: # Valeur IMPAIRE (A, 3, 5, 7, 9, J, K)
+                # ♦️ → ♣️ et ♣️ → ♦️
+                return {'♦': C, '♣': D}.get(normalized_suit, normalized_suit)
+
+    # --- Jeux IMPAIRS (is_odd_game est True) ---
     else:
-        return SUIT_MAPPING_EVEN.get(normalized, normalized)
-
-def is_message_finalized(message: str) -> bool:
-    """Vérifie si le message est un résultat final."""
-    if '⏰' in message:
-        return False
-    return '✅' in message or '🔰' in message
+        # 1. Enseigne : H ou S (❤️ ou ♠️)
+        if normalized_suit in [H, S]:
+            if not is_value_odd: # Valeur PAIRE (2, 4, 6, 8, 10, Q)
+                # ♠️ → ❤️ et ❤️ → ♣️
+                return {'♠': H, '♥': C}.get(normalized_suit, normalized_suit)
+            else: # Valeur IMPAIRE (A, 3, 5, 7, 9, J, K)
+                # ♠️ → ♦️ et ❤️ → ♠️
+                return {'♠': D, '♥': S}.get(normalized_suit, normalized_suit)
+        
+        # 2. Enseigne : D ou C (♦️ ou ♣️)
+        elif normalized_suit in [D, C]:
+            if not is_value_odd: # Valeur PAIRE (2, 4, 6, 8, 10, Q)
+                # ♦️ → ❤️ et ♣️ → ♠️
+                return {'♦': H, '♣': S}.get(normalized_suit, normalized_suit)
+            else: # Valeur IMPAIRE (A, 3, 5, 7, 9, J, K)
+                # ♦️ → ♦️ et ♣️ → ♣️ (Aucune transformation)
+                return normalized_suit
+    
+    return normalized_suit
 
 # --- Logique de Prédiction (Immédiate) ---
 
@@ -174,8 +240,8 @@ async def send_prediction_to_channel(target_game: int, predicted_suit: str, base
             'base_game': base_game,
             'base_suit': base_suit,
             'status': '⏳',
-            'r_offset': R_OFFSET, # NOUVEAU: Stocke l'offset R de vérification
-            'verification_attempt': 0, # NOUVEAU: Compteur d'essais
+            'r_offset': R_OFFSET,
+            'verification_attempt': 0,
             'created_at': datetime.now().isoformat()
         }
 
@@ -195,30 +261,30 @@ async def update_prediction_status(game_number: int, new_status: str, verificati
         pred = pending_predictions[game_number]
         suit = pred['suit']
         display_suit = SUIT_DISPLAY.get(suit, suit)
-        base_game = pred['base_game']
-        base_suit = pred['base_suit']
-        base_display = SUIT_DISPLAY.get(base_suit, base_suit)
         
         # Calcul de l'index de vérification (N+0, N+1, N+2, ...)
         verification_index = 0
         if verification_game_number is not None:
              verification_index = verification_game_number - game_number
 
-        # NOUVEAU CODE (Remplacement des Lignes 157-163)
+        # --- CODE MODIFIÉ POUR LA SIMPLIFICATION DU MESSAGE DE STATUT ---
         if new_status == '✅':
-            # Utilise l'emoji basé sur l'index de vérification
+            # Utilise l'emoji basé sur l'index de vérification (ex: ✅0️⃣, ✅1️⃣)
             status_emoji = VERIFICATION_EMOJIS.get(verification_index, '✅')
-            # ⚜🟩validé sur N+{verification_index} est retiré
-            # La ligne 'premier enseigne...' est retirée
-            # La ligne de transformation est retirée
-            updated_msg = f"📲Game:{game_number}:{display_suit} statut :{status_emoji}" # Simplification ici
+            
+            # Message de statut simplifié
+            updated_msg = f"📲Game:{game_number}:{display_suit} statut :{status_emoji}"
+            
+            logger.info(f"✅ Prédiction #{game_number} mise à jour: {new_status} (Essai N+{verification_index})")
         else:
             updated_msg = f"📲Game:{game_number}:{display_suit} statut :{new_status}"
+            logger.info(f"❌ Prédiction #{game_number} mise à jour: {new_status}")
+        # --- FIN DE LA MODIFICATION ---
+
 
         if PREDICTION_CHANNEL_ID and pred['message_id'] > 0 and prediction_channel_ok:
             try:
                 await client.edit_message(PREDICTION_CHANNEL_ID, pred['message_id'], updated_msg)
-                logger.info(f"✅ Prédiction #{game_number} mise à jour: {new_status} (Essai N+{verification_index})")
             except Exception as e:
                 logger.error(f"❌ Erreur mise à jour dans le canal: {e}")
 
@@ -267,16 +333,24 @@ async def process_prediction(message_text: str):
             return
 
         second_group = groups[1]
-        first_suit_second_group = get_first_suit_in_group(second_group)
+        
+        # NOUVEAU: Extraction de la valeur ET de la couleur
+        card_value, base_suit = extract_first_card_details(second_group)
 
-        if first_suit_second_group:
-            predicted_suit = get_predicted_suit(first_suit_second_group, game_number)
+        if base_suit:
+            # NOUVEAU: Appel de la nouvelle fonction de prédiction
+            predicted_suit = get_predicted_suit(base_suit, card_value, game_number)
             target_game = game_number + A_OFFSET # Utilise A_OFFSET
 
             if target_game not in pending_predictions:
                 parity = "impair" if is_odd(game_number) else "pair"
-                logger.info(f"🎯 Jeu #{game_number} ({parity}): {first_suit_second_group} -> Prédiction #{target_game}: {predicted_suit} (N+{A_OFFSET})")
-                await send_prediction_to_channel(target_game, predicted_suit, game_number, first_suit_second_group)
+                
+                # NOUVEAU: Affichage de la carte complète si la valeur est trouvée
+                card_info = f"{card_value or ''}{SUIT_DISPLAY.get(base_suit, base_suit)}"
+                
+                logger.info(f"🎯 Jeu #{game_number} ({parity}): Carte {card_info} -> Prédiction #{target_game}: {predicted_suit} (N+{A_OFFSET})")
+                
+                await send_prediction_to_channel(target_game, predicted_suit, game_number, base_suit)
             else:
                 logger.info(f"Prédiction #{target_game} déjà active")
 
@@ -340,7 +414,6 @@ async def process_verification(message_text: str):
                 else:
                     # ÉCHEC (Essai non final), on incrémente le compteur pour le prochain jeu
                     pred['verification_attempt'] += 1
-                    # Note: On ne met pas à jour le statut du message ici, on attend soit le succès, soit l'échec final.
                     logger.info(f"⏳ Jeu #{current_game_number}: {SUIT_DISPLAY.get(target_suit, target_suit)} non trouvé. Continue vérification pour #{pred_game_number} (Essai: {pred['verification_attempt']})")
 
     except Exception as e:
@@ -428,7 +501,7 @@ async def schedule_periodic_reset():
 
 async def schedule_daily_reset():
     """Reset quotidien à 00h59 WAT (UTC+1)."""
-    wat_tz = timezone(timedelta(hours=1))
+    wat_tz = timezone(timedelta(hours=1)) # Heure du Bénin (WAT = UTC+1)
     
     while True:
         now = datetime.now(wat_tz)
@@ -438,7 +511,7 @@ async def schedule_daily_reset():
             reset_time += timedelta(days=1)
         
         wait_seconds = (reset_time - now).total_seconds()
-        logger.info(f"⏰ Prochain reset quotidien dans {wait_seconds/3600:.1f} heures")
+        logger.info(f"⏰ Prochain reset quotidien à 00h59 WAT dans {wait_seconds/3600:.1f} heures")
         
         await asyncio.sleep(wait_seconds)
         
@@ -520,10 +593,6 @@ async def cmd_debug(event):
 • Jeu actuel: #{current_game_number}
 • Prédictions actives: {len(pending_predictions)}
 
-**Règles de transformation:**
-• Jeux PAIRS: ♠️→♣️, ♣️→♠️, ♦️→♥️, ♥️→♦️
-• Jeux IMPAIRS: ♠️→♥️, ♣️→♦️, ♦️→♣️, ♥️→♠️
-
 **Reset automatique:**
 • Toutes les 2 heures
 • Quotidien à 00h59 WAT
@@ -537,24 +606,20 @@ async def cmd_help(event):
 
     await event.respond("""📖 **Aide - Bot de Prédiction Baccarat**
 
-**Règles de prédiction:**
-Le bot lit le 2ème groupe du message source et prend la 1ère carte (couleur).
+**Règles de prédiction (Mise à Jour!):**
+Le bot lit la 1ère carte (Valeur et Couleur) du 2ème groupe du message source.
 La prédiction est envoyée IMMÉDIATEMENT pour le jeu **N + A_OFFSET**.
+
+**Logique de Transformation (Complexe):**
+La transformation dépend de la **parité du jeu (N)** et de la **parité de la carte (Paire/Impaire)**.
 
 **Vérification:**
 Attend que le message soit finalisé (✅ ou 🔰).
 Vérifie si le costume prédit est dans le PREMIER groupe pour les jeux **N+0 à N+R_OFFSET**.
 
-**Transformation selon parité du jeu:**
-• Jeux PAIRS (ex: #1220):
-  ♠️→♣️, ♣️→♠️, ♦️→♥️, ♥️→♦️
-  
-• Jeux IMPAIRS (ex: #1219):
-  ♠️→♥️, ♣️→♦️, ♦️→♣️, ♥️→♠️
-
 **Reset automatique:**
 • Toutes les 2 heures
-• Quotidien à 00h59 WAT
+• Quotidien à 00h59 WAT (Heure du Bénin)
 
 **Commandes Administrateur:**
 • `/a [valeur]` - Définit l'offset de prédiction (défaut: 1)
@@ -683,14 +748,15 @@ API_HASH = os.getenv('API_HASH') or ''
 BOT_TOKEN = os.getenv('BOT_TOKEN') or ''
 PORT = int(os.getenv('PORT') or '10000')
 
-SUIT_MAPPING_EVEN = {'♠': '♣', '♣': '♠', '♦': '♥', '♥': '♦'}
+# MAPPINGS OBSOLETES (main.py utilise une logique complexe)
+SUIT_MAPPING_EVEN = {'♠': '♣', '♣': '♠', '♦': '♥', '♥': '♦'} 
 SUIT_MAPPING_ODD = {'♠': '♥', '♣': '♦', '♦': '♣', '♥': '♠'}
+
 ALL_SUITS = ['♥', '♠', '♦', '♣']
 SUIT_DISPLAY = {'♠': '♠️', '♥': '❤️', '♦': '♦️', '♣': '♣️'}
 SUIT_NORMALIZE = {'❤️': '♥', '❤': '♥', '♥️': '♥', '♠️': '♠', '♦️': '♦', '♣️': '♣'}
 
-# --- NOUVELLES CONFIGURATIONS ---
-
+# --- CONFIGURATIONS PERSISTANTES ---
 A_OFFSET_DEFAULT = 1
 R_OFFSET_DEFAULT = 0
 
@@ -711,7 +777,7 @@ VERIFICATION_EMOJIS = {
         with open(os.path.join(deploy_dir, 'config.py'), 'w', encoding='utf-8') as f:
             f.write(config_content)
 
-        # Copie de main.py (utilise le contenu mis à jour)
+        # Copie de main.py
         with open('main.py', 'r', encoding='utf-8') as f:
             main_content = f.read()
         with open(os.path.join(deploy_dir, 'main.py'), 'w', encoding='utf-8') as f:
@@ -769,24 +835,20 @@ openpyxl==3.1.2
    - BOT_TOKEN: Token de votre bot (@BotFather)
    - ADMIN_ID: Votre ID Telegram
 
-## Règles de Prédiction
+## Règles de Prédiction (Mise à Jour)
 
 **Configuration par commandes:**
 - `/a [valeur]`: Offset de prédiction (N -> N + A_OFFSET)
 - `/r [valeur]`: Nombre d'essais de vérification (N+0 à N+R_OFFSET)
 
 **Prédiction (immédiate):**
-- Lit la première carte du 2ème groupe
-- Applique la transformation selon parité du jeu
+- Lit la première carte (Valeur et Couleur) du 2ème groupe
+- Applique la nouvelle transformation complexe dépendante de la **parité du jeu** et de la **parité de la carte (Paire/Impaire)**.
 - Prédit pour le jeu **N + A_OFFSET**
 
 **Vérification (après finalisation):**
 - Vérifie si le costume prédit est dans le 1er groupe
 - La vérification se fait sur les jeux consécutifs **N+0 jusqu'à N+R_OFFSET**.
-
-**Transformations:**
-- Jeux PAIRS: ♠️→♣️, ♣️→♠️, ♦️→♥️, ♥️→♦️
-- Jeux IMPAIRS: ♠️→♥️, ♣️→♦️, ♦️→♣️, ♥️→♠️
 
 **Reset automatique:**
 - Toutes les 2 heures
@@ -813,7 +875,7 @@ openpyxl==3.1.2
         await client.send_file(
             event.chat_id,
             zip_path,
-            caption=f"📦 **ren.zip**\n\nFichier prêt pour déploiement sur Render.com (port 10000)\n\nContenu:\n• main.py\n• config.py\n• requirements.txt\n• render.yaml\n• README.md\n• **bot_config.json** (pour persistance)\n\n**Nouveautés:**\n• Commandes `/a` et `/r`\n• Persistance de la configuration\n• Vérification sur N+0 à N+R"
+            caption=f"📦 **ren.zip**\n\nFichier prêt pour déploiement sur Render.com (port 10000)\n\nContenu:\n• main.py (nouvelle logique complexe)\n• config.py\n• requirements.txt\n• render.yaml\n• README.md\n• **bot_config.json** (pour persistance)\n\n**Mises à jour:**\n• Nouvelle règle de prédiction complexe (parité jeu + parité carte)\n• Message de statut de vérification simplifié\n• Persistance des offsets `/a` et `/r`"
         )
 
         shutil.rmtree(deploy_dir)
