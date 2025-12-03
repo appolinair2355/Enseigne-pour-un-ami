@@ -16,8 +16,8 @@ def parse_channel_id(env_var: str, default: str) -> int:
     except ValueError:
         return 0
 
-SOURCE_CHANNEL_ID = parse_channel_id('SOURCE_CHANNEL_ID', '-1002682552255')
-PREDICTION_CHANNEL_ID = parse_channel_id('PREDICTION_CHANNEL_ID', '-1003343276131')
+SOURCE_CHANNEL_ID = parse_channel_id('SOURCE_CHANNEL_ID', '-1003464313784')
+PREDICTION_CHANNEL_ID = parse_channel_id('PREDICTION_CHANNEL_ID', '-1003300736833')
 ADMIN_ID = int(os.getenv('ADMIN_ID') or '0')
 API_ID = int(os.getenv('API_ID') or '0')
 API_HASH = os.getenv('API_HASH') or ''
