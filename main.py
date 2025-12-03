@@ -204,13 +204,14 @@ async def update_prediction_status(game_number: int, new_status: str, verificati
         if verification_game_number is not None:
              verification_index = verification_game_number - game_number
 
+        # NOUVEAU CODE (Remplacement des Lignes 157-163)
         if new_status == '✅':
             # Utilise l'emoji basé sur l'index de vérification
             status_emoji = VERIFICATION_EMOJIS.get(verification_index, '✅')
-            parity = "Impaire" if is_odd(base_game) else "Paire"
-            updated_msg = f"""📲Game:{game_number}:{display_suit} statut :{status_emoji}
-⚜🟩validé sur N+{verification_index}   premier enseigne du Banquier : {base_display} numero du jeu precedent {parity}
-{base_display}={display_suit}"""
+            # ⚜🟩validé sur N+{verification_index} est retiré
+            # La ligne 'premier enseigne...' est retirée
+            # La ligne de transformation est retirée
+            updated_msg = f"📲Game:{game_number}:{display_suit} statut :{status_emoji}" # Simplification ici
         else:
             updated_msg = f"📲Game:{game_number}:{display_suit} statut :{new_status}"
 
