@@ -1,63 +1,52 @@
+"""
+Configuration du bot Telegram de prédiction Baccarat
+"""
 import os
-import sys
+import json # NOUVEAU
 
-# --- FONCTION UTILITAIRE POUR LA CONVERSION ---
-def get_env_var(name, default=None, is_int=False):
-    """Récupère une variable d'environnement et gère la conversion de type et les erreurs."""
-    value = os.getenv(name, default)
-    if value is None or value == "":
-        # Si la variable n'est pas trouvée (cas Render manquant), on laisse la valeur par défaut (souvent None)
-        return default
-        
-    if is_int:
-        try:
-            return int(value)
-        except ValueError:
-            # Si l'ID est fourni mais n'est pas un nombre, on affiche une erreur et s'arrête
-            print(f"FATAL ERROR: Environment variable '{name}' must be an integer.")
-            sys.exit(1)
-            
-    return value
+def parse_channel_id(env_var: str, default: str) -> int:
+    value = os.getenv(env_var) or default
+    if value.startswith('-100'):
+        return int(value)
+    try:
+        channel_id = int(value)
+        if channel_id > 0 and len(str(channel_id)) >= 10:
+            return int(f"-100{channel_id}") 
+        return channel_id
+    except ValueError:
+        return 0
 
-# --- 1. CONFIGURATION OBLIGATOIRE DU BOT TELEGRAM (Lue depuis l'environnement) ---
+SOURCE_CHANNEL_ID = parse_channel_id('SOURCE_CHANNEL_ID', '-1002682552255')
+PREDICTION_CHANNEL_ID = parse_channel_id('PREDICTION_CHANNEL_ID', '-1003343276131')
+ADMIN_ID = int(os.getenv('ADMIN_ID') or '0')
+API_ID = int(os.getenv('API_ID') or '0')
+API_HASH = os.getenv('API_HASH') or ''
+BOT_TOKEN = os.getenv('BOT_TOKEN') or ''
+PORT = int(os.getenv('PORT') or '10000')
 
-# 🔑 API ID : Récupération depuis l'environnement, doit être un entier
-API_ID = get_env_var("API_ID", default=0, is_int=True)
+SUIT_MAPPING_EVEN = {'♠': '♣', '♣': '♠', '♦': '♥', '♥': '♦'}
+SUIT_MAPPING_ODD = {'♠': '♥', '♣': '♦', '♦': '♣', '♥': '♠'}
+ALL_SUITS = ['♥', '♠', '♦', '♣']
+SUIT_DISPLAY = {'♠': '♠️', '♥': '❤️', '♦': '♦️', '♣': '♣️'}
+SUIT_NORMALIZE = {'❤️': '♥', '❤': '♥', '♥️': '♥', '♠️': '♠', '♦️': '♦', '♣️': '♣'}
 
-# 🔑 API Hash : Récupération depuis l'environnement
-API_HASH = get_env_var("API_HASH", default="")
+# --- NOUVELLES CONFIGURATIONS ---
 
-# 🔑 Bot Token : Récupération depuis l'environnement
-BOT_TOKEN = get_env_var("BOT_TOKEN", default="")
+# Offsets par défaut
+A_OFFSET_DEFAULT = 1 # Décalage de prédiction (N -> N + A_OFFSET)
+R_OFFSET_DEFAULT = 0 # Nombre d'essais de vérification (N+0 à N+R_OFFSET)
 
-# 👑 ID de l'administrateur (peut être lu depuis l'environnement ou fixé)
-# Si vous le fixez ici, il ne sera pas écrasé par l'environnement
-ADMIN_ID = 1190237801
-
-
-# --- 2. CONFIGURATION DES CANAUX (Fixées ou lues) ---
-
-# ➡️ ID du canal SOURCE
-SOURCE_CHANNEL_ID = -1001003464313784 
-
-# ⬅️ ID du canal PRÉDICTION
-PREDICTION_CHANNEL_ID = -1003300736833
-
-# --- 3. CONFIGURATION DU SERVEUR WEB ---
-# Lit le port de l'environnement (essentiel pour Render)
-PORT = int(os.environ.get("PORT", 8080))
-
-# --- 4. CONFIGURATION DES COULEURS (Cartes) ---
-
-ALL_SUITS = ['♠', '♣', '♦', '♥']
-
-SUIT_DISPLAY = {
-    '♠': 'Pique', 
-    '♣': 'Trèfle', 
-    '♦': 'Carreau', 
-    '♥': 'Cœur'
+# Emojis de vérification selon l'offset (N+0, N+1, N+2, etc.)
+VERIFICATION_EMOJIS = {
+    0: "✅0️⃣",  # 1er essai (N+0)
+    1: "✅1️⃣",  # 2ème essai (N+1)
+    2: "✅2️⃣",  # 3ème essai (N+2)
+    3: "✅3️⃣",  # 4ème essai (N+3)
+    4: "✅4️⃣",  # 5ème essai (N+4)
+    5: "✅5️⃣",  # 6ème essai (N+5)
+    6: "✅6️⃣",  # 7ème essai (N+6)
+    7: "✅7️⃣",  # 8ème essai (N+7)
+    8: "✅8️⃣",  # 9ème essai (N+8)
+    9: "✅9️⃣",  # 10ème essai (N+9)
+    10: "✅🔟"  # 11ème essai (N+10)
 }
-
-# Mappage pour l'ancienne logique (à définir si besoin, sinon vide)
-SUIT_MAPPING = {} 
-    
