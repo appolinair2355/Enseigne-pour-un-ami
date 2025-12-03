@@ -3,15 +3,18 @@ import asyncio
 import re
 import logging
 import sys
+import zipfile
+import shutil
+import json # NOUVEAU
 from datetime import datetime, timedelta, timezone, time
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from aiohttp import web
-# Assurez-vous d'avoir les variables SOURCE_CHANNEL_ID et PREDICTION_CHANNEL_ID dans config.py
 from config import (
     API_ID, API_HASH, BOT_TOKEN, ADMIN_ID,
     SOURCE_CHANNEL_ID, PREDICTION_CHANNEL_ID, PORT,
-    SUIT_MAPPING, ALL_SUITS, SUIT_DISPLAY
+    SUIT_MAPPING_EVEN, SUIT_MAPPING_ODD, ALL_SUITS, SUIT_DISPLAY, SUIT_NORMALIZE,
+    A_OFFSET_DEFAULT, R_OFFSET_DEFAULT, VERIFICATION_EMOJIS # NOUVEAU
 )
 
 # --- Configuration et Initialisation ---
@@ -24,7 +27,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Vérifications minimales de la configuration
+# Vérifications de la configuration
 if not API_ID or API_ID == 0:
     logger.error("API_ID manquant")
     exit(1)
@@ -37,35 +40,61 @@ if not BOT_TOKEN:
 
 logger.info(f"Configuration: SOURCE_CHANNEL={SOURCE_CHANNEL_ID}, PREDICTION_CHANNEL={PREDICTION_CHANNEL_ID}")
 
-# Initialisation du client Telegram avec session string ou nouvelle session
+# Initialisation du client Telegram
 session_string = os.getenv('TELEGRAM_SESSION', '')
 client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
 
 # --- Variables Globales d'État ---
 pending_predictions = {}
-queued_predictions = {}
-recent_games = {}
-processed_messages = set()
-last_transferred_game = None
+processed_predictions = set()
+processed_verifications = set()
 current_game_number = 0
-
-# Nouvel état pour les prédictions planifiées manuellement par l'admin
-PLANNED_PREDICTIONS = {} # Format: {game_number_P: '♠', ...}
-planning_session = {} # État temporaire pour la commande /plan_predictions
-
-last_processed_game_data = None 
-
-MAX_PENDING_PREDICTIONS = 2  # Nombre maximal de prédictions actives
-PROXIMITY_THRESHOLD = 3      # Nombre de jeux avant l'envoi depuis la file d'attente (distance 3 ou 2)
-
-# Le délai 'a' n'est plus pertinent pour la génération, mais conservé pour les commandes de statut
-PREDICTION_DELAY = 1         
-
 source_channel_ok = False
 prediction_channel_ok = False
-transfer_enabled = True # Initialisé à True. Contrôlé par /stop_transfert
+transfer_enabled = True
+# NOUVEAU: Offsets de configuration persistants
+A_OFFSET = A_OFFSET_DEFAULT
+R_OFFSET = R_OFFSET_DEFAULT
+CONFIG_FILE = 'bot_config.json'
+
+# --- NOUVEAU: Fonctions de Persistance ---
+
+def load_config():
+    """Charge la configuration depuis le fichier JSON."""
+    global A_OFFSET, R_OFFSET
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+                A_OFFSET = config.get('a_offset', A_OFFSET_DEFAULT)
+                R_OFFSET = config.get('r_offset', R_OFFSET_DEFAULT)
+            logger.info(f"⚙️ Configuration chargée: A_OFFSET={A_OFFSET}, R_OFFSET={R_OFFSET}")
+        except Exception as e:
+            logger.error(f"Erreur chargement config: {e}")
+            A_OFFSET = A_OFFSET_DEFAULT
+            R_OFFSET = R_OFFSET_DEFAULT
+    else:
+        logger.info("⚙️ Fichier config.json non trouvé. Utilisation des valeurs par défaut.")
+        save_config() # Sauvegarde les valeurs par défaut si le fichier n'existe pas
+
+def save_config():
+    """Sauvegarde la configuration dans le fichier JSON."""
+    try:
+        config = {
+            'a_offset': A_OFFSET,
+            'r_offset': R_OFFSET
+        }
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4)
+        logger.info("⚙️ Configuration sauvegardée.")
+    except Exception as e:
+        logger.error(f"Erreur sauvegarde config: {e}")
 
 # --- Fonctions d'Analyse ---
+
+def normalize_suit(suit: str) -> str:
+    """Normalise un symbole de couleur."""
+    return SUIT_NORMALIZE.get(suit, suit)
 
 def extract_game_number(message: str):
     """Extrait le numéro de jeu du message."""
@@ -78,39 +107,54 @@ def extract_parentheses_groups(message: str):
     """Extrait le contenu entre parenthèses."""
     return re.findall(r"\(([^)]*)\)", message)
 
-def normalize_suits(group_str: str) -> str:
-    """Normalise les symboles de couleur."""
-    normalized = group_str.replace('❤️', '♥').replace('❤', '♥').replace('♥️', '♥')
-    normalized = normalized.replace('♠️', '♠').replace('♦️', '♦').replace('♣️', '♣')
-    return normalized
+def get_first_suit_in_group(group_str: str) -> str:
+    """Trouve la première couleur (suit) dans un groupe."""
+    suit_pattern = r'[♠♥♦♣]|♠️|♥️|♦️|♣️|❤️|❤'
+    match = re.search(suit_pattern, group_str)
+    if match:
+        return normalize_suit(match.group())
+    return None
 
-def get_suits_in_group(group_str: str):
-    """Liste toutes les couleurs (suits) présentes dans une chaîne."""
-    normalized = normalize_suits(group_str)
-    return [s for s in ALL_SUITS if s in normalized]
-
-def has_suit_in_group(group_str: str, target_suit: str) -> bool:
-    """Vérifie si la couleur cible est présente dans le groupe ciblé."""
-    normalized = normalize_suits(group_str)
-    target_normalized = normalize_suits(target_suit)
-    for suit in ALL_SUITS:
-        if suit in target_normalized and suit in normalized:
+def suit_in_group(group_str: str, target_suit: str) -> bool:
+    """Vérifie si une couleur est présente dans un groupe."""
+    normalized_target = normalize_suit(target_suit)
+    suit_pattern = r'[♠♥♦♣]|♠️|♥️|♦️|♣️|❤️|❤'
+    matches = re.findall(suit_pattern, group_str)
+    for match in matches:
+        if normalize_suit(match) == normalized_target:
             return True
     return False
 
+def is_odd(number: int) -> bool:
+    """Vérifie si un numéro est impair."""
+    return number % 2 != 0
+
+def get_predicted_suit(base_suit: str, game_number: int) -> str:
+    """
+    Applique la transformation selon le numéro de jeu:
+    - Jeux PAIRS: ♠️→♣️, ♣️→♠️, ♦️→♥️, ♥️→♦️
+    - Jeux IMPAIRS: ♠️→♥️, ♣️→♦️, ♦️→♣️, ♥️→♠️
+    """
+    normalized = normalize_suit(base_suit)
+    if is_odd(game_number):
+        return SUIT_MAPPING_ODD.get(normalized, normalized)
+    else:
+        return SUIT_MAPPING_EVEN.get(normalized, normalized)
+
 def is_message_finalized(message: str) -> bool:
-    """Vérifie si le message est un résultat final (non en cours)."""
+    """Vérifie si le message est un résultat final."""
     if '⏰' in message:
         return False
     return '✅' in message or '🔰' in message
 
-# --- Logique de Prédiction et File d'Attente ---
+# --- Logique de Prédiction (Immédiate) ---
 
-async def send_prediction_to_channel(target_game: int, predicted_suit: str, base_game: int):
-    """Envoie la prédiction au canal de prédiction (Nouveau Format)."""
+async def send_prediction_to_channel(target_game: int, predicted_suit: str, base_game: int, base_suit: str):
+    """Envoie la prédiction au canal de prédiction."""
+    global R_OFFSET
     try:
-        # NOUVEAU FORMAT DE MESSAGE INITIAL
-        prediction_msg = f"""📲Game: {target_game}:{predicted_suit} statut :🔮 1️⃣"""
+        display_suit = SUIT_DISPLAY.get(predicted_suit, predicted_suit)
+        prediction_msg = f"📲Game:{target_game}:{display_suit} statut :⏳"
 
         msg_id = 0
 
@@ -118,102 +162,71 @@ async def send_prediction_to_channel(target_game: int, predicted_suit: str, base
             try:
                 pred_msg = await client.send_message(PREDICTION_CHANNEL_ID, prediction_msg)
                 msg_id = pred_msg.id
-                logger.info(f"✅ Prédiction envoyée au canal de prédiction {PREDICTION_CHANNEL_ID}")
+                logger.info(f"✅ Prédiction envoyée au canal: Jeu #{target_game} -> {display_suit}")
             except Exception as e:
                 logger.error(f"❌ Erreur envoi prédiction au canal: {e}")
         else:
-            logger.warning(f"⚠️ Canal de prédiction non accessible, prédiction non envoyée")
+            logger.warning(f"⚠️ Canal de prédiction non accessible")
 
         pending_predictions[target_game] = {
             'message_id': msg_id,
             'suit': predicted_suit,
             'base_game': base_game,
-            'status': '🔮',
-            'check_count': 1, # Initialisation à 1
+            'base_suit': base_suit,
+            'status': '⏳',
+            'r_offset': R_OFFSET, # NOUVEAU: Stocke l'offset R de vérification
+            'verification_attempt': 0, # NOUVEAU: Compteur d'essais
             'created_at': datetime.now().isoformat()
         }
 
-        logger.info(f"Prédiction active: Jeu #{target_game} - {predicted_suit} (basé sur #{base_game})")
+        logger.info(f"Prédiction active: Jeu #{target_game} - {display_suit} (basé sur #{base_game})")
         return msg_id
 
     except Exception as e:
         logger.error(f"Erreur envoi prédiction: {e}")
         return None
 
-def queue_prediction(target_game: int, predicted_suit: str, base_game: int):
-    """Met une prédiction en file d'attente pour un envoi différé (gestion du stock)."""
-    if target_game in queued_predictions or target_game in pending_predictions:
-        logger.info(f"Prédiction #{target_game} déjà en file ou active, ignorée")
-        return False
-
-    queued_predictions[target_game] = {
-        'target_game': target_game,
-        'predicted_suit': predicted_suit,
-        'base_game': base_game,
-        'queued_at': datetime.now().isoformat()
-    }
-    logger.info(f"📋 Prédiction #{target_game} mise en file d'attente (sera envoyée quand proche)")
-    return True
-
-async def check_and_send_queued_predictions(current_game: int):
-    """Vérifie la file d'attente et envoie si la distance est de 2 ou 3 jeux."""
-    global current_game_number
-    current_game_number = current_game
-
-    sorted_queued = sorted(queued_predictions.keys())
-
-    for target_game in sorted(sorted_queued):
-        
-        distance = target_game - current_game
-
-        # --- RÈGLE DE SUPPRESSION (DISTANCE 1 OU 0 MANQUÉE) ---
-        if distance <= 1: 
-            logger.warning(f"⚠️ Prédiction #{target_game} est à une distance {distance}. Fenêtre d'envoi manquée. Supprimée.")
-            queued_predictions.pop(target_game, None)
-            continue 
-        
-        # --- RÈGLE D'ENVOI (DISTANCE 2 ou 3) ---
-        if len(pending_predictions) >= MAX_PENDING_PREDICTIONS:
-            logger.info(f"⏸️ Stock actif plein ({len(pending_predictions)}/{MAX_PENDING_PREDICTIONS}), prédiction #{target_game} reste en file.")
-            continue
-        
-        if distance <= PROXIMITY_THRESHOLD and distance > 1: 
-            pred_data = queued_predictions.pop(target_game)
-            logger.info(f"🎯 Jeu #{current_game} - Prédiction #{target_game} proche ({distance} jeux), envoi maintenant!")
-
-            await send_prediction_to_channel(
-                pred_data['target_game'],
-                pred_data['predicted_suit'],
-                pred_data['base_game']
-            )
-
-async def update_prediction_status(game_number: int, new_status: str):
-    """Met à jour le message de prédiction dans le canal et son statut interne (Format Final)."""
+async def update_prediction_status(game_number: int, new_status: str, verification_game_number: int = None):
+    """Met à jour le message de prédiction dans le canal."""
     try:
         if game_number not in pending_predictions:
             return False
 
         pred = pending_predictions[game_number]
-        message_id = pred['message_id']
         suit = pred['suit']
+        display_suit = SUIT_DISPLAY.get(suit, suit)
+        base_game = pred['base_game']
+        base_suit = pred['base_suit']
+        base_display = SUIT_DISPLAY.get(base_suit, base_suit)
+        
+        # Calcul de l'index de vérification (N+0, N+1, N+2, ...)
+        verification_index = 0
+        if verification_game_number is not None:
+             verification_index = verification_game_number - game_number
 
-        # NOUVEAU FORMAT DE MESSAGE FINAL
-        updated_msg = f"""📲Game: {game_number}:{suit} statut :{new_status}"""
+        if new_status == '✅':
+            # Utilise l'emoji basé sur l'index de vérification
+            status_emoji = VERIFICATION_EMOJIS.get(verification_index, '✅')
+            parity = "Impaire" if is_odd(base_game) else "Paire"
+            updated_msg = f"""📲Game:{game_number}:{display_suit} statut :{status_emoji}
+⚜🟩validé sur N+{verification_index}   premier enseigne du Banquier : {base_display} numero du jeu precedent {parity}
+{base_display}={display_suit}"""
+        else:
+            updated_msg = f"📲Game:{game_number}:{display_suit} statut :{new_status}"
 
-        if PREDICTION_CHANNEL_ID and PREDICTION_CHANNEL_ID != 0 and message_id > 0 and prediction_channel_ok:
+        if PREDICTION_CHANNEL_ID and pred['message_id'] > 0 and prediction_channel_ok:
             try:
-                await client.edit_message(PREDICTION_CHANNEL_ID, message_id, updated_msg)
-                logger.info(f"✅ Prédiction #{game_number} mise à jour dans le canal: {new_status}")
+                await client.edit_message(PREDICTION_CHANNEL_ID, pred['message_id'], updated_msg)
+                logger.info(f"✅ Prédiction #{game_number} mise à jour: {new_status} (Essai N+{verification_index})")
             except Exception as e:
                 logger.error(f"❌ Erreur mise à jour dans le canal: {e}")
 
         pred['status'] = new_status
-        logger.info(f"Prédiction #{game_number} mise à jour: {new_status}")
 
-        # Les prédictions terminées sont supprimées du stock actif
         if new_status in ['✅', '❌']:
+            # La prédiction est terminée
             del pending_predictions[game_number]
-            logger.info(f"Prédiction #{game_number} terminée et supprimée")
+            logger.info(f"Prédiction #{game_number} terminée: {new_status}")
 
         return True
 
@@ -221,474 +234,674 @@ async def update_prediction_status(game_number: int, new_status: str):
         logger.error(f"Erreur mise à jour prédiction: {e}")
         return False
 
-async def check_prediction_result(game_number: int, banker_group: str):
-    """Vérifie les résultats des prédictions actives (Jeu P) en utilisant la main du Banquier (deuxième groupe)."""
-    
-    if game_number in pending_predictions:
-        pred = pending_predictions[game_number]
-        target_suit = pred['suit']
+# --- Traitement des Messages ---
 
-        # Utilisation du groupe du Banquier pour la validation
-        if has_suit_in_group(banker_group, target_suit): 
-            await update_prediction_status(game_number, '✅')
-            return True
-        else:
-            await update_prediction_status(game_number, '❌')
-            return False
-
-    return None
-# Continuité du code de la partie 1/2
-
-async def process_finalized_message(message_text: str, chat_id: int):
-    """Traite un message pour le déclenchement (P-1, non finalisé) et la vérification (P, finalisé)."""
-    global last_transferred_game, current_game_number, last_processed_game_data
+async def process_prediction(message_text: str):
+    """
+    PRÉDICTION: Se fait immédiatement dès qu'un numéro est détecté.
+    N'attend PAS que le message soit finalisé.
+    """
+    global current_game_number, A_OFFSET
     try:
         game_number = extract_game_number(message_text)
         if game_number is None:
             return
 
         current_game_number = game_number
-        message_hash = f"{game_number}_{message_text[:50]}"
-        if message_hash in processed_messages:
-            return
-        processed_messages.add(message_hash)
 
-        if len(processed_messages) > 200:
-            processed_messages.clear()
+        # Éviter les doublons de prédiction
+        if game_number in processed_predictions:
+            return
+        processed_predictions.add(game_number)
+
+        # Nettoyer l'historique
+        if len(processed_predictions) > 500:
+            old_predictions = sorted(processed_predictions)[:250]
+            for p in old_predictions:
+                processed_predictions.discard(p)
 
         groups = extract_parentheses_groups(message_text)
-        if len(groups) < 2: 
-            banker_group = ""
-        else:
-            # Le Banquier est dans le deuxième groupe (groups[1])
-            banker_group = groups[1] 
-
-        # --- Transfert à l'administrateur (si activé) ---
-        if transfer_enabled and ADMIN_ID and ADMIN_ID != 0 and last_transferred_game != game_number:
-            try:
-                transfer_msg = f"📨 **Message reçu du canal source (Finalisé: {is_message_finalized(message_text)}):**\n\n{message_text}"
-                await client.send_message(ADMIN_ID, transfer_msg)
-                last_transferred_game = game_number
-            except Exception as e:
-                logger.error(f"❌ Erreur transfert à votre bot: {e}")
-        
-        # --- LOGIQUE DE DÉCLENCHEMENT DES PRÉDICTIONS PLANIFIÉES (Basée sur P-1) ---
-        # Cette logique s'exécute pour TOUS les messages du canal source (non finalisés ou finalisés)
-        game_to_trigger = game_number + 1
-        
-        if game_to_trigger in PLANNED_PREDICTIONS:
-            
-            target_suit = PLANNED_PREDICTIONS.pop(game_to_trigger)
-            
-            # Logique pour extraire la première carte de P-1 (pour le journal)
-            first_banker_suit_match = re.search(r"[♠♣♦♥]", normalize_suits(banker_group))
-            trigger_suit_info = first_banker_suit_match.group(0) if first_banker_suit_match else "N/A"
-            
-            logger.info(f"🚨 DÉCLENCHEMENT PLANIFIÉ: Jeu P-1=#{game_number} reçu (Banquier commence par {trigger_suit_info}) -> Envoi de P=#{game_to_trigger} ({target_suit})")
-            
-            queue_prediction(
-                game_to_trigger,
-                target_suit,
-                game_number # P-1 est le jeu de base
-            )
-            await check_and_send_queued_predictions(game_number) 
-        
-        # --- VÉRIFICATION DU STATUT (UNIQUEMENT POUR MESSAGES FINALISÉS) ---
-        
-        if not is_message_finalized(message_text):
-            # Le reste du traitement ne concerne que la vérification finale (statut)
+        if len(groups) < 2:
+            logger.info(f"Jeu #{game_number}: Pas assez de groupes pour prédiction")
             return
 
-        # Le message est finalisé : nous vérifions le statut du jeu P (game_number)
-        
-        # 1. Vérification des résultats existants (Jeu cible P)
-        await check_prediction_result(game_number, banker_group) 
+        second_group = groups[1]
+        first_suit_second_group = get_first_suit_in_group(second_group)
 
-        # 2. Envoi des prédictions en file d'attente (si proche)
-        await check_and_send_queued_predictions(game_number)
+        if first_suit_second_group:
+            predicted_suit = get_predicted_suit(first_suit_second_group, game_number)
+            target_game = game_number + A_OFFSET # Utilise A_OFFSET
 
-        # 3. Stockage (pour journal/debug)
-        suits_current = set(get_suits_in_group(banker_group))
-        last_processed_game_data = {
-            'game_number': game_number,
-            'banker_group': banker_group, 
-            'suits': suits_current
-        }
-
-        recent_games[game_number] = {
-            'banker_group': banker_group,
-            'timestamp': datetime.now().isoformat()
-        }
-        if len(recent_games) > 100:
-            oldest = min(recent_games.keys())
-            del recent_games[oldest]
+            if target_game not in pending_predictions:
+                parity = "impair" if is_odd(game_number) else "pair"
+                logger.info(f"🎯 Jeu #{game_number} ({parity}): {first_suit_second_group} -> Prédiction #{target_game}: {predicted_suit} (N+{A_OFFSET})")
+                await send_prediction_to_channel(target_game, predicted_suit, game_number, first_suit_second_group)
+            else:
+                logger.info(f"Prédiction #{target_game} déjà active")
 
     except Exception as e:
-        logger.error(f"Erreur traitement message: {e}")
+        logger.error(f"Erreur traitement prédiction: {e}")
         import traceback
         logger.error(traceback.format_exc())
-    
-# --- Gestion des Messages (Hooks Telethon) ---
+
+async def process_verification(message_text: str):
+    """
+    VÉRIFICATION: Attend que le message soit finalisé.
+    Vérifie si le costume prédit est dans le PREMIER groupe.
+    Gère la vérification sur N+0 à N+R_OFFSET.
+    """
+    try:
+        if not is_message_finalized(message_text):
+            return
+
+        current_game_number = extract_game_number(message_text)
+        if current_game_number is None:
+            return
+
+        # Éviter les doublons de vérification
+        message_hash = f"{current_game_number}_{message_text[:80]}"
+        if message_hash in processed_verifications:
+            return
+        processed_verifications.add(message_hash)
+
+        # Nettoyer l'historique
+        if len(processed_verifications) > 500:
+            processed_verifications.clear()
+        
+        groups = extract_parentheses_groups(message_text)
+        if len(groups) < 1:
+            return
+
+        first_group = groups[0]
+        
+        # --- LOGIQUE DE VÉRIFICATION SUR R_OFFSET ESSAIS ---
+        
+        # Parcourir les prédictions en attente (pending_predictions)
+        for pred_game_number, pred in list(pending_predictions.items()):
+            target_suit = pred['suit']
+            r_offset = pred['r_offset']
+            
+            # Si le jeu actuel est dans la fenêtre de vérification (de N+0 à N+r_offset)
+            # La fenêtre va de pred_game_number (N+0) à pred_game_number + r_offset
+            if pred_game_number <= current_game_number <= pred_game_number + r_offset:
+                
+                # Vérifier si la couleur prédite est dans le PREMIER groupe
+                if suit_in_group(first_group, target_suit):
+                    # SUCCÈS
+                    logger.info(f"✅ Jeu #{current_game_number}: {SUIT_DISPLAY.get(target_suit, target_suit)} trouvé dans le 1er groupe! (Prédiction #{pred_game_number})")
+                    await update_prediction_status(pred_game_number, '✅', current_game_number)
+                
+                elif current_game_number == pred_game_number + r_offset:
+                    # ÉCHEC (Dernier essai atteint)
+                    logger.info(f"❌ Jeu #{current_game_number}: {SUIT_DISPLAY.get(target_suit, target_suit)} NON trouvé après {r_offset} essais. (Prédiction #{pred_game_number})")
+                    await update_prediction_status(pred_game_number, '❌')
+                
+                else:
+                    # ÉCHEC (Essai non final), on incrémente le compteur pour le prochain jeu
+                    pred['verification_attempt'] += 1
+                    # Note: On ne met pas à jour le statut du message ici, on attend soit le succès, soit l'échec final.
+                    logger.info(f"⏳ Jeu #{current_game_number}: {SUIT_DISPLAY.get(target_suit, target_suit)} non trouvé. Continue vérification pour #{pred_game_number} (Essai: {pred['verification_attempt']})")
+
+    except Exception as e:
+        logger.error(f"Erreur traitement vérification: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+async def transfer_to_admin(message_text: str):
+    """Transfère le message à l'admin si activé."""
+    if transfer_enabled and ADMIN_ID and ADMIN_ID != 0:
+        try:
+            await client.send_message(ADMIN_ID, f"📨 Message:\n\n{message_text}")
+        except Exception as e:
+            logger.error(f"❌ Erreur transfert admin: {e}")
+
+# --- Gestion des Messages Telegram ---
 
 @client.on(events.NewMessage())
 async def handle_message(event):
-    """Gère les nouveaux messages dans le canal source et la saisie admin."""
-    
-    # Gestion de la saisie admin pour la planification
-    if event.is_private and event.sender_id == ADMIN_ID:
-        await capture_plan_input(event)
-
-    # Traitement des messages du canal source (Doit traiter TOUS les messages pour le trigger P-1)
+    """Gère les nouveaux messages dans le canal source."""
     try:
         chat = await event.get_chat()
         chat_id = chat.id if hasattr(chat, 'id') else event.chat_id
+
         if chat_id > 0 and hasattr(chat, 'broadcast') and chat.broadcast:
             chat_id = -1000000000000 - chat_id
 
         if chat_id == SOURCE_CHANNEL_ID:
             message_text = event.message.message
-            await process_finalized_message(message_text, chat_id)
+            
+            # Prédiction immédiate (n'attend pas la finalisation)
+            await process_prediction(message_text)
+            
+            # Vérification (attend la finalisation)
+            await process_verification(message_text)
 
     except Exception as e:
         logger.error(f"Erreur handle_message: {e}")
 
 @client.on(events.MessageEdited())
 async def handle_edited_message(event):
-    """Gère les messages édités dans le canal source (essentiel pour le statut final)."""
+    """Gère les messages édités dans le canal source."""
     try:
         chat = await event.get_chat()
         chat_id = chat.id if hasattr(chat, 'id') else event.chat_id
+
         if chat_id > 0 and hasattr(chat, 'broadcast') and chat.broadcast:
             chat_id = -1000000000000 - chat_id
 
         if chat_id == SOURCE_CHANNEL_ID:
             message_text = event.message.message
-            await process_finalized_message(message_text, chat_id)
+            
+            # Vérification sur messages édités (attend la finalisation)
+            await process_verification(message_text)
 
     except Exception as e:
         logger.error(f"Erreur handle_edited_message: {e}")
 
-# --- Commandes Administrateur et Planification ---
+# --- Reset Automatique ---
+
+async def reset_all_data():
+    """Efface toutes les données stockées."""
+    global pending_predictions, processed_predictions, processed_verifications, current_game_number
+    
+    count = len(pending_predictions)
+    pending_predictions.clear()
+    processed_predictions.clear()
+    processed_verifications.clear()
+    current_game_number = 0
+    
+    logger.info(f"🔄 Reset effectué - {count} prédictions effacées")
+    
+    if ADMIN_ID and ADMIN_ID != 0:
+        try:
+            await client.send_message(ADMIN_ID, f"🔄 **Reset automatique effectué**\n\n{count} prédictions effacées.")
+        except:
+            pass
+
+async def schedule_periodic_reset():
+    """Reset automatique toutes les 2 heures."""
+    while True:
+        await asyncio.sleep(2 * 60 * 60)  # 2 heures
+        logger.info("⏰ Reset périodique (2h)...")
+        await reset_all_data()
+
+async def schedule_daily_reset():
+    """Reset quotidien à 00h59 WAT (UTC+1)."""
+    wat_tz = timezone(timedelta(hours=1))
+    
+    while True:
+        now = datetime.now(wat_tz)
+        reset_time = now.replace(hour=0, minute=59, second=0, microsecond=0)
+        
+        if now >= reset_time:
+            reset_time += timedelta(days=1)
+        
+        wait_seconds = (reset_time - now).total_seconds()
+        logger.info(f"⏰ Prochain reset quotidien dans {wait_seconds/3600:.1f} heures")
+        
+        await asyncio.sleep(wait_seconds)
+        
+        logger.info("🌙 Reset quotidien à 00h59 WAT...")
+        await reset_all_data()
+        
+        # Petite pause pour éviter les doubles déclenchements
+        await asyncio.sleep(60)
+
+# --- Commandes Administrateur ---
+
+def is_admin(sender_id):
+    return ADMIN_ID and ADMIN_ID != 0 and sender_id == ADMIN_ID
 
 @client.on(events.NewMessage(pattern='/start'))
 async def cmd_start(event):
-    if event.is_group or event.is_channel: return
-    await event.respond("🤖 **Bot de Prédiction Baccarat**\n\nCommandes: `/status`, `/help`, `/plan_predictions`, `/stop_transfert`")
+    if event.is_group or event.is_channel:
+        return
+    await event.respond("🤖 **Bot de Prédiction Baccarat**\n\nCommandes: `/status`, `/help`, `/debug`, `/deploy`, `/reset`, `/a`, `/r`")
 
 @client.on(events.NewMessage(pattern='/status'))
 async def cmd_status(event):
-    if event.is_group or event.is_channel: return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+    if event.is_group or event.is_channel:
+        return
+    if not is_admin(event.sender_id):
         await event.respond("Commande réservée à l'administrateur")
         return
 
-    status_msg = f"📊 **État des prédictions:**\n\n🎮 Jeu actuel: #{current_game_number}\n"
-    
-    if PLANNED_PREDICTIONS:
-        status_msg += f"\n**📝 Planifiées ({len(PLANNED_PREDICTIONS)}):**\n"
-        for game_num, suit in sorted(PLANNED_PREDICTIONS.items()):
-            distance = game_num - current_game_number
-            status_msg += f"• Jeu P=#{game_num} ({suit}) - Déclenchement à P-1=#{game_num - 1} (dans {distance} jeux)\n"
-    else: status_msg += "\n**📝 Aucune prédiction planifiée**\n"
+    status_msg = f"📊 **État des prédictions:**\n\n🎮 Jeu actuel: #{current_game_number}\n\n"
     
     if pending_predictions:
-        status_msg += f"\n**🔮 Actives ({len(pending_predictions)}):**\n"
+        status_msg += f"**🔮 Actives ({len(pending_predictions)}):**\n"
         for game_num, pred in sorted(pending_predictions.items()):
-            distance = game_num - current_game_number
-            status_msg += f"• Jeu P=#{game_num} ({pred['suit']}) - Statut: {pred['status']} (basé sur P-1=#{pred['base_game']} - dans {distance} jeux)\n"
-    else: status_msg += "\n**🔮 Aucune prédiction active**\n"
+            display_suit = SUIT_DISPLAY.get(pred['suit'], pred['suit'])
+            status_msg += f"• Jeu #{game_num}: {display_suit} - Statut: {pred['status']} (Base #{pred['base_game']}, R={pred['r_offset']}, Essai {pred['verification_attempt']})\n"
+    else:
+        status_msg += "**🔮 Aucune prédiction active**\n"
 
-    if queued_predictions:
-        status_msg += f"\n**📋 En file d'attente ({len(queued_predictions)}):**\n"
-        for game_num, pred in sorted(queued_predictions.items()):
-            distance = game_num - current_game_number
-            status_msg += f"• Jeu P=#{game_num} ({pred['predicted_suit']}) (basé sur P-1=#{pred['base_game']} - dans {distance} jeux)\n"
-    else: status_msg += "\n**📋 Aucune prédiction en file**\n"
-    
-    status_transfert = "Activé" if transfer_enabled else "Désactivé"
-    status_msg += f"\n**État du Transfert Admin**: {status_transfert}"
     await event.respond(status_msg)
+
+@client.on(events.NewMessage(pattern='/reset'))
+async def cmd_reset(event):
+    if event.is_group or event.is_channel:
+        return
+    if not is_admin(event.sender_id):
+        await event.respond("Commande réservée à l'administrateur")
+        return
+    
+    await reset_all_data()
+    await event.respond("🔄 **Reset manuel effectué!**\n\nToutes les prédictions ont été effacées.")
+
+@client.on(events.NewMessage(pattern='/debug'))
+async def cmd_debug(event):
+    if event.is_group or event.is_channel:
+        return
+    if not is_admin(event.sender_id):
+        await event.respond("Commande réservée à l'administrateur")
+        return
+    
+    emojis = ", ".join([f"{VERIFICATION_EMOJIS[i]}" for i in range(R_OFFSET + 1)])
+
+    debug_msg = f"""🔍 **Informations de débogage:**
+
+**Configuration:**
+• Source Channel: {SOURCE_CHANNEL_ID}
+• Prediction Channel: {PREDICTION_CHANNEL_ID}
+• Admin ID: {ADMIN_ID}
+
+**Accès aux canaux:**
+• Canal source: {'✅ OK' if source_channel_ok else '❌ Non accessible'}
+• Canal prédiction: {'✅ OK' if prediction_channel_ok else '❌ Non accessible'}
+
+**Offsets (Persistants):**
+• A_OFFSET (/a): N + {A_OFFSET} (Prédiction pour N + A_OFFSET)
+• R_OFFSET (/r): {R_OFFSET} (Vérification de N+0 à N+R_OFFSET)
+• Emojis de succès: {emojis}
+
+**État:**
+• Jeu actuel: #{current_game_number}
+• Prédictions actives: {len(pending_predictions)}
+
+**Règles de transformation:**
+• Jeux PAIRS: ♠️→♣️, ♣️→♠️, ♦️→♥️, ♥️→♦️
+• Jeux IMPAIRS: ♠️→♥️, ♣️→♦️, ♦️→♣️, ♥️→♠️
+
+**Reset automatique:**
+• Toutes les 2 heures
+• Quotidien à 00h59 WAT
+"""
+    await event.respond(debug_msg)
 
 @client.on(events.NewMessage(pattern='/help'))
 async def cmd_help(event):
-    if event.is_group or event.is_channel: return
+    if event.is_group or event.is_channel:
+        return
 
-    await event.respond(f"""📖 **Aide - Bot de Prédiction Baccarat**\n
-### 🤖 Mode de Fonctionnement (Planification Manuelle)
-1.  **Planification**: L'administrateur utilise `/plan_predictions` pour **enregistrer manuellement** le numéro de jeu $P$ et la couleur prédite.
-2.  **Déclenchement (Clé)**: Le bot surveille le canal source. Dès qu'il voit un message (même non finalisé) pour le jeu **$P-1$**, il envoie **immédiatement** la prédiction $P$.
-3.  **Vérification (Statut)**: Le statut final (✅ ou ❌) est mis à jour **uniquement** lorsque le message du jeu $P$ est reçu et **finalisé**. Le bot vérifie si la couleur prédite est dans le **deuxième groupe (Banquier)**.
+    await event.respond("""📖 **Aide - Bot de Prédiction Baccarat**
 
-### ⚙️ Règles de Stockage/Envoi
-1.  Max **{MAX_PENDING_PREDICTIONS}** prédictions actives à la fois (stock).
-2.  Envoi depuis la file d'attente **uniquement** si la distance est de **{PROXIMITY_THRESHOLD} ou {PROXIMITY_THRESHOLD - 1} jeux**.
-3.  Toute prédiction atteignant la distance **1 ou 0** dans la file est **supprimée** (fenêtre manquée).
-\n**Commandes Administrateur:** • `/plan_predictions` : Lance le mode interactif de planification (Ajouter/Supprimer/Enregistrer).
-• `/stop_transfert` : Active/Désactive l'envoi des messages sources à l'admin.
-• `/status` : Affiche les prédictions planifiées et actives.
+**Règles de prédiction:**
+Le bot lit le 2ème groupe du message source et prend la 1ère carte (couleur).
+La prédiction est envoyée IMMÉDIATEMENT pour le jeu **N + A_OFFSET**.
+
+**Vérification:**
+Attend que le message soit finalisé (✅ ou 🔰).
+Vérifie si le costume prédit est dans le PREMIER groupe pour les jeux **N+0 à N+R_OFFSET**.
+
+**Transformation selon parité du jeu:**
+• Jeux PAIRS (ex: #1220):
+  ♠️→♣️, ♣️→♠️, ♦️→♥️, ♥️→♦️
+  
+• Jeux IMPAIRS (ex: #1219):
+  ♠️→♥️, ♣️→♦️, ♦️→♣️, ♥️→♠️
+
+**Reset automatique:**
+• Toutes les 2 heures
+• Quotidien à 00h59 WAT
+
+**Commandes Administrateur:**
+• `/a [valeur]` - Définit l'offset de prédiction (défaut: 1)
+• `/r [valeur]` - Définit le nombre d'essais de vérification (0 à 10, défaut: 0)
+• `/status` - Voir les prédictions actives
+• `/debug` - Informations système
+• `/reset` - Reset manuel des prédictions
+• `/deploy` - Télécharger le bot pour Render.com
+• `/transfert` - Activer le transfert des messages
+• `/stoptransfert` - Désactiver le transfert
+• `/help` - Cette aide
 """)
 
-@client.on(events.NewMessage(pattern='/stop_transfert'))
-async def cmd_stop_transfert(event):
-    global transfer_enabled
-    if event.is_group or event.is_channel: return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+@client.on(events.NewMessage(pattern='/a(?: (\d+))?'))
+async def cmd_a_offset(event):
+    if event.is_group or event.is_channel:
+        return
+    if not is_admin(event.sender_id):
         await event.respond("Commande réservée à l'administrateur")
         return
     
-    transfer_enabled = not transfer_enabled
-    status = "Activé" if transfer_enabled else "Désactivé"
-    await event.respond(f"✅ **Transfert des messages source à l'admin** : {status}")
+    global A_OFFSET
+    match = re.match(r'/a (\d+)', event.message.message)
+    
+    if match:
+        new_a = int(match.group(1))
+        A_OFFSET = new_a
+        save_config()
+        await event.respond(f"✅ **Offset de prédiction (/a)** mis à jour.\n\nLa prédiction sera lancée pour le jeu **N + {A_OFFSET}**.")
+    else:
+        await event.respond(f"ℹ️ **Offset de prédiction actuel (/a): N + {A_OFFSET}**\n\nUtilisation: `/a [valeur]` (ex: `/a 3`)")
 
-# --- Commandes pour la Planification ---
 
-@client.on(events.NewMessage(pattern='/plan_predictions'))
-async def cmd_plan_start(event):
-    if event.is_group or event.is_channel: return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+@client.on(events.NewMessage(pattern='/r(?: (\d+))?'))
+async def cmd_r_offset(event):
+    if event.is_group or event.is_channel:
+        return
+    if not is_admin(event.sender_id):
         await event.respond("Commande réservée à l'administrateur")
         return
-
-    user_id = event.sender_id
     
-    # Affichage du plan actuel au début
-    plans_text = "\n".join([f"• #{n}: {s}" for n, s in sorted(PLANNED_PREDICTIONS.items())])
-    if not plans_text: plans_text = "Aucune prédiction enregistrée."
-
-    buttons = [
-        [events.Button.inline(f'Ajouter N° et Couleur', data='plan_add')],
-        [events.Button.inline(f'Supprimer un N°', data='plan_delete')],
-        [events.Button.inline('Enregistrer la Saisie', data='plan_save'),
-         events.Button.inline('Annuler la Saisie', data='plan_cancel')]
-    ]
-
-    await event.respond(
-        f"📝 **Planification Manuelle de Prédictions**\n\n**Plans Actifs (Globaux) :**\n{plans_text}",
-        buttons=buttons
-    )
-
-@client.on(events.CallbackQuery(data=re.compile(r'plan_(add|save|cancel|delete)')))
-async def callback_plan_handler(event):
-    global PLANNED_PREDICTIONS
-    user_id = event.sender_id
+    global R_OFFSET
+    match = re.match(r'/r (\d+)', event.message.message)
     
-    if user_id != ADMIN_ID and ADMIN_ID != 0:
-        await event.answer("Accès refusé.")
-        return
-
-    action = event.pattern_match.group(1)
-    
-    if action == 'add':
-        planning_session[user_id] = planning_session.get(user_id, [])
-        await event.edit("Entrez la prédiction au format `N°_JEU,Couleur` (ex: `1250,♠`).")
-        await event.answer("Prêt à recevoir la saisie d'ajout...")
-
-    elif action == 'delete':
-        await event.edit("Entrez le **N°_JEU** à supprimer (ex: `1250`).")
-        # Marquer l'attente pour la suppression
-        planning_session[user_id] = 'DELETING' 
-        await event.answer("Prêt à recevoir la saisie de suppression...")
-        
-    elif action == 'save':
-        if not planning_session.get(user_id) or planning_session.get(user_id) == 'DELETING':
-            await event.edit("❌ Aucune nouvelle prédiction à enregistrer.", buttons=None)
-            await event.answer("Rien à enregistrer.")
-            return
-
-        new_plans = planning_session.pop(user_id)
-        count = 0
-        for game_num, suit in new_plans:
-            PLANNED_PREDICTIONS[game_num] = suit
-            count += 1
-            
-        await event.edit(f"✅ **{count} prédiction(s) planifiée(s) enregistrée(s).**", buttons=None)
-        await event.answer("Prédictions enregistrées.")
-        
-    elif action == 'cancel':
-        planning_session.pop(user_id, None)
-        await event.edit("🛑 **Planification annulée.**", buttons=None)
-        await event.answer("Annulé.")
-
-@client.on(events.NewMessage())
-async def capture_plan_input(event):
-    user_id = event.sender_id
-    
-    if user_id in planning_session and event.message.message and event.is_private:
-        text = event.message.message.strip()
-        
-        if text.startswith('/plan_predictions'): return
-        
-        # Logique de suppression
-        if planning_session.get(user_id) == 'DELETING':
-            if text.isdigit():
-                game_num = int(text)
-                planning_session.pop(user_id) # Fin de la session de suppression
-                
-                if game_num in PLANNED_PREDICTIONS:
-                    del PLANNED_PREDICTIONS[game_num]
-                    await event.respond(f"✅ Prédiction #{game_num} **supprimée** du plan.", buttons=None)
-                else:
-                    await event.respond(f"⚠️ Prédiction #{game_num} non trouvée dans le plan actif.", buttons=None)
-            else:
-                await event.respond("❌ Veuillez entrer uniquement le numéro de jeu à supprimer.")
-            return
-
-        # Logique d'ajout
-        match = re.match(r"(\d+),\s*([♠♣♦♥])", text, re.IGNORECASE)
-        
-        if match:
-            game_num = int(match.group(1))
-            suit = match.group(2).upper()
-            
-            if current_game_number > 0 and game_num <= current_game_number:
-                await event.respond(f"❌ Impossible de planifier le jeu #{game_num}, le jeu actuel est déjà #{current_game_number}.")
-                return
-            
-            planning_session[user_id].append((game_num, suit))
-            
-            current_plans = planning_session[user_id]
-            plans_text = "\n".join([f"• #{n}: {s}" for n, s in sorted(current_plans)])
-
-            buttons = [
-                [events.Button.inline(f'Ajouter N° et Couleur', data='plan_add')],
-                [events.Button.inline(f'Supprimer un N°', data='plan_delete')],
-                [events.Button.inline('Enregistrer la Saisie', data='plan_save'),
-                 events.Button.inline('Annuler la Saisie', data='plan_cancel')]
-            ]
-
-            await event.respond(
-                f"✅ Prédiction ajoutée : #{game_num} $\\rightarrow$ {suit}.\n\n**Saisie en cours ({len(current_plans)}):**\n{plans_text}",
-                buttons=buttons
-            )
+    if match:
+        new_r = int(match.group(1))
+        if 0 <= new_r <= 10:
+            R_OFFSET = new_r
+            save_config()
+            emojis = ", ".join([f"{VERIFICATION_EMOJIS[i]}" for i in range(new_r + 1)])
+            await event.respond(f"""✅ **Offset de vérification (/r)** mis à jour: **{R_OFFSET}** essais supplémentaires.
+La vérification se fera de N+0 à N+{R_OFFSET}.
+\n**Émojis de succès:** {emojis}""")
         else:
-            await event.respond("❌ Format incorrect. Veuillez utiliser `N°_JEU,Couleur` (ex: `1250,♠`).")
-        
+            await event.respond("❌ La valeur de /r doit être comprise entre **0** et **10**.")
+    else:
+        emojis = ", ".join([f"{VERIFICATION_EMOJIS[i]}" for i in range(R_OFFSET + 1)])
+        await event.respond(f"""ℹ️ **Offset de vérification actuel (/r): {R_OFFSET}**
+La vérification se fait sur **{R_OFFSET + 1}** jeux (N+0 à N+{R_OFFSET}).
+\n**Émojis de succès:** {emojis}
+\nUtilisation: `/r [valeur]` (ex: `/r 2`)""")
 
-# --- Commandes de Décalage (conservées mais moins pertinentes) ---
-
-@client.on(events.NewMessage(pattern='/setdelay (\d+)'))
-async def cmd_setdelay(event):
-    global PREDICTION_DELAY
-    if event.is_group or event.is_channel: return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+@client.on(events.NewMessage(pattern='/transfert|/activetransfert'))
+async def cmd_active_transfert(event):
+    if event.is_group or event.is_channel:
+        return
+    if not is_admin(event.sender_id):
         await event.respond("Commande réservée à l'administrateur")
         return
+    global transfer_enabled
+    transfer_enabled = True
+    await event.respond("✅ Transfert des messages activé!")
+
+@client.on(events.NewMessage(pattern='/stoptransfert'))
+async def cmd_stop_transfert(event):
+    if event.is_group or event.is_channel:
+        return
+    if not is_admin(event.sender_id):
+        await event.respond("Commande réservée à l'administrateur")
+        return
+    global transfer_enabled
+    transfer_enabled = False
+    await event.respond("⛔ Transfert des messages désactivé.")
+
+@client.on(events.NewMessage(pattern='/deploy'))
+async def cmd_deploy(event):
+    """Génère un fichier ZIP deployable sur Render.com"""
+    if event.is_group or event.is_channel:
+        return
+    if not is_admin(event.sender_id):
+        await event.respond("Commande réservée à l'administrateur")
+        return
+
+    await event.respond("📦 Préparation du fichier de déploiement...")
 
     try:
-        new_delay = int(event.pattern_match.group(1))
-        if new_delay <= 0:
-            await event.respond("Le délai doit être un entier positif (P = N + a)")
-            return
-            
-        PREDICTION_DELAY = new_delay
-        await event.respond(f"✅ **Délai de prédiction (a) mis à jour!**\n(Note: Non utilisé pour la planification manuelle.)")
+        deploy_dir = '/tmp/deploy_package'
+        if os.path.exists(deploy_dir):
+            shutil.rmtree(deploy_dir)
+        os.makedirs(deploy_dir)
 
-    except Exception:
-        await event.respond("Format invalide. Utilisation: `/setdelay <nombre>`.")
+        # Création de config.py (utilise le contenu mis à jour)
+        config_content = '''"""
+Configuration du bot Telegram de prédiction Baccarat
+"""
+import os
+import json
 
-@client.on(events.NewMessage(pattern='/delay'))
-async def cmd_getdelay(event):
-    if event.is_group or event.is_channel: return
-    await event.respond(f"Le délai de prédiction actuel est `a = {PREDICTION_DELAY}`.\n(Note: Non utilisé pour la planification manuelle.)")
+def parse_channel_id(env_var: str, default: str) -> int:
+    value = os.getenv(env_var) or default
+    if value.startswith('-100'):
+        return int(value)
+    try:
+        channel_id = int(value)
+        if channel_id > 0 and len(str(channel_id)) >= 10:
+            return int(f"-100{channel_id}") 
+        return channel_id
+    except ValueError:
+        return 0
 
-# --- Serveur Web et Démarrage ---
+SOURCE_CHANNEL_ID = parse_channel_id('SOURCE_CHANNEL_ID', '-1002682552255')
+PREDICTION_CHANNEL_ID = parse_channel_id('PREDICTION_CHANNEL_ID', '-1003343276131')
+ADMIN_ID = int(os.getenv('ADMIN_ID') or '0')
+API_ID = int(os.getenv('API_ID') or '0')
+API_HASH = os.getenv('API_HASH') or ''
+BOT_TOKEN = os.getenv('BOT_TOKEN') or ''
+PORT = int(os.getenv('PORT') or '10000')
+
+SUIT_MAPPING_EVEN = {'♠': '♣', '♣': '♠', '♦': '♥', '♥': '♦'}
+SUIT_MAPPING_ODD = {'♠': '♥', '♣': '♦', '♦': '♣', '♥': '♠'}
+ALL_SUITS = ['♥', '♠', '♦', '♣']
+SUIT_DISPLAY = {'♠': '♠️', '♥': '❤️', '♦': '♦️', '♣': '♣️'}
+SUIT_NORMALIZE = {'❤️': '♥', '❤': '♥', '♥️': '♥', '♠️': '♠', '♦️': '♦', '♣️': '♣'}
+
+# --- NOUVELLES CONFIGURATIONS ---
+
+A_OFFSET_DEFAULT = 1
+R_OFFSET_DEFAULT = 0
+
+VERIFICATION_EMOJIS = {
+    0: "✅0️⃣",
+    1: "✅1️⃣",
+    2: "✅2️⃣",
+    3: "✅3️⃣",
+    4: "✅4️⃣",
+    5: "✅5️⃣",
+    6: "✅6️⃣",
+    7: "✅7️⃣",
+    8: "✅8️⃣",
+    9: "✅9️⃣",
+    10: "✅🔟"
+}
+'''
+        with open(os.path.join(deploy_dir, 'config.py'), 'w', encoding='utf-8') as f:
+            f.write(config_content)
+
+        # Copie de main.py (utilise le contenu mis à jour)
+        with open('main.py', 'r', encoding='utf-8') as f:
+            main_content = f.read()
+        with open(os.path.join(deploy_dir, 'main.py'), 'w', encoding='utf-8') as f:
+            f.write(main_content)
+
+        # Création de requirements.txt
+        requirements_content = '''telethon==1.35.0
+aiohttp==3.9.5
+python-dotenv==1.0.1
+pyyaml==6.0.1
+openpyxl==3.1.2
+'''
+        with open(os.path.join(deploy_dir, 'requirements.txt'), 'w', encoding='utf-8') as f:
+            f.write(requirements_content)
+
+        # Création de render.yaml
+        render_content = '''services:
+  - type: web
+    name: telegram-prediction-bot
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: SOURCE_CHANNEL_ID
+        value: -1002682552255
+      - key: PREDICTION_CHANNEL_ID
+        value: -1003343276131
+'''
+        with open(os.path.join(deploy_dir, 'render.yaml'), 'w', encoding='utf-8') as f:
+            f.write(render_content)
+
+        # Création de README.md
+        readme_content = f'''# Bot de Prédiction Baccarat
+
+## Déploiement sur Render.com
+
+1. Créez un compte sur https://render.com
+2. Uploadez ce projet sur GitHub
+3. Sur Render, créez un nouveau "Web Service" depuis votre repo GitHub
+4. Configurez les variables d'environnement:
+   - API_ID: Votre API ID Telegram
+   - API_HASH: Votre API Hash Telegram
+   - BOT_TOKEN: Token de votre bot (@BotFather)
+   - ADMIN_ID: Votre ID Telegram
+
+## Règles de Prédiction
+
+**Configuration par commandes:**
+- `/a [valeur]`: Offset de prédiction (N -> N + A_OFFSET)
+- `/r [valeur]`: Nombre d'essais de vérification (N+0 à N+R_OFFSET)
+
+**Prédiction (immédiate):**
+- Lit la première carte du 2ème groupe
+- Applique la transformation selon parité du jeu
+- Prédit pour le jeu **N + A_OFFSET**
+
+**Vérification (après finalisation):**
+- Vérifie si le costume prédit est dans le 1er groupe
+- La vérification se fait sur les jeux consécutifs **N+0 jusqu'à N+R_OFFSET**.
+
+**Transformations:**
+- Jeux PAIRS: ♠️→♣️, ♣️→♠️, ♦️→♥️, ♥️→♦️
+- Jeux IMPAIRS: ♠️→♥️, ♣️→♦️, ♦️→♣️, ♥️→♠️
+
+**Reset automatique:**
+- Toutes les 2 heures
+- Quotidien à 00h59 WAT
+'''
+        with open(os.path.join(deploy_dir, 'README.md'), 'w', encoding='utf-8') as f:
+            f.write(readme_content)
+
+        zip_path = '/tmp/ren.zip'
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+
+        # Inclusion d'un fichier bot_config.json vide pour le déploiement initial
+        with open(os.path.join(deploy_dir, CONFIG_FILE), 'w', encoding='utf-8') as f:
+            json.dump({'a_offset': A_OFFSET_DEFAULT, 'r_offset': R_OFFSET_DEFAULT}, f, indent=4)
+
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(deploy_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, deploy_dir)
+                    zipf.write(file_path, arcname)
+
+        await client.send_file(
+            event.chat_id,
+            zip_path,
+            caption=f"📦 **ren.zip**\n\nFichier prêt pour déploiement sur Render.com (port 10000)\n\nContenu:\n• main.py\n• config.py\n• requirements.txt\n• render.yaml\n• README.md\n• **bot_config.json** (pour persistance)\n\n**Nouveautés:**\n• Commandes `/a` et `/r`\n• Persistance de la configuration\n• Vérification sur N+0 à N+R"
+        )
+
+        shutil.rmtree(deploy_dir)
+        os.remove(zip_path)
+
+        logger.info("✅ Fichier ren.zip envoyé")
+
+    except Exception as e:
+        logger.error(f"Erreur création deploy: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+# --- Serveur Web ---
 
 async def index(request):
-    html = f"""<!DOCTYPE html><html><head><title>Bot Prédiction Baccarat</title></head><body><h1>🎯 Bot de Prédiction Baccarat</h1><p>Le bot est en ligne et surveille les canaux.</p><p><strong>Jeu actuel:</strong> #{current_game_number}</p></body></html>"""
+    html = f"""<!DOCTYPE html>
+<html>
+<head><title>Bot Prédiction Baccarat</title></head>
+<body>
+<h1>🎯 Bot de Prédiction Baccarat</h1>
+<p>Le bot est en ligne et surveille les canaux.</p>
+<p><strong>Jeu actuel:</strong> #{current_game_number}</p>
+<p><strong>Prédictions actives:</strong> {len(pending_predictions)}</p>
+<p><strong>Config:</strong> A={A_OFFSET}, R={R_OFFSET}</p>
+</body>
+</html>"""
     return web.Response(text=html, content_type='text/html', status=200)
 
 async def health_check(request):
     return web.Response(text="OK", status=200)
 
 async def start_web_server():
-    """Démarre le serveur web pour la vérification de l'état (health check)."""
     app = web.Application()
     app.router.add_get('/', index)
     app.router.add_get('/health', health_check)
-
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start() 
+    await site.start()
+    logger.info(f"🌐 Serveur web démarré sur le port {PORT}")
 
-async def schedule_daily_reset():
-    """Tâche planifiée pour la réinitialisation quotidienne des stocks de prédiction à 00h59 WAT."""
-    wat_tz = timezone(timedelta(hours=1)) 
-    reset_time = time(0, 59, tzinfo=wat_tz)
+# --- Démarrage Principal ---
 
-    logger.info(f"Tâche de reset planifiée pour {reset_time} WAT.")
-
-    while True:
-        now = datetime.now(wat_tz)
-        target_datetime = datetime.combine(now.date(), reset_time, tzinfo=wat_tz)
-        if now >= target_datetime:
-            target_datetime += timedelta(days=1)
-            
-        time_to_wait = (target_datetime - now).total_seconds()
-
-        logger.info(f"Prochain reset dans {timedelta(seconds=time_to_wait)}")
-        await asyncio.sleep(time_to_wait)
-
-        logger.warning("🚨 RESET QUOTIDIEN À 00h59 WAT DÉCLENCHÉ!")
-        
-        global pending_predictions, queued_predictions, recent_games, processed_messages, last_transferred_game, current_game_number, last_processed_game_data, PLANNED_PREDICTIONS
-
-        pending_predictions.clear()
-        queued_predictions.clear()
-        recent_games.clear()
-        processed_messages.clear()
-        PLANNED_PREDICTIONS.clear()
-        last_transferred_game = None
-        current_game_number = 0
-        last_processed_game_data = None
-        
-        logger.warning("✅ Toutes les données de prédiction ont été effacées.")
-
-async def start_bot():
-    """Démarre le client Telegram et les vérifications initiales."""
+async def verify_channels():
+    """Vérifie l'accès aux canaux."""
     global source_channel_ok, prediction_channel_ok
+
     try:
-        await client.start(bot_token=BOT_TOKEN)
-        
-        source_channel_ok = True
-        prediction_channel_ok = True 
-        logger.info("Bot connecté et canaux marqués comme accessibles.")
-        return True
+        if SOURCE_CHANNEL_ID and SOURCE_CHANNEL_ID != 0:
+            try:
+                entity = await client.get_entity(SOURCE_CHANNEL_ID)
+                source_channel_ok = True
+                logger.info(f"✅ Accès au canal source: {getattr(entity, 'title', SOURCE_CHANNEL_ID)}")
+            except Exception as e:
+                logger.error(f"❌ Impossible d'accéder au canal source: {e}")
+
+        if PREDICTION_CHANNEL_ID and PREDICTION_CHANNEL_ID != 0:
+            try:
+                entity = await client.get_entity(PREDICTION_CHANNEL_ID)
+                prediction_channel_ok = True
+                logger.info(f"✅ Accès au canal de prédiction: {getattr(entity, 'title', PREDICTION_CHANNEL_ID)}")
+            except Exception as e:
+                logger.error(f"❌ Impossible d'accéder au canal de prédiction: {e}")
+
     except Exception as e:
-        logger.error(f"Erreur démarrage du client Telegram: {e}")
-        return False
+        logger.error(f"Erreur vérification canaux: {e}")
 
 async def main():
-    """Fonction principale pour lancer le serveur web, le bot et la tâche de reset."""
+    """Fonction principale."""
     try:
+        load_config() # Chargement de la config A et R au démarrage
+        
+        await client.start(bot_token=BOT_TOKEN)
+        me = await client.get_me()
+        logger.info(f"✅ Bot connecté: @{me.username}")
+
+        await verify_channels()
         await start_web_server()
 
-        success = await start_bot()
-        if not success:
-            logger.error("Échec du démarrage du bot")
-            return
-
-        # Lancement de la tâche de reset en arrière-plan
+        # Lancer les tâches de reset automatique
+        asyncio.create_task(schedule_periodic_reset())
         asyncio.create_task(schedule_daily_reset())
-        
-        logger.info("Bot complètement opérationnel - En attente de messages...")
+
+        logger.info("🚀 Bot opérationnel - En attente de messages...")
         await client.run_until_disconnected()
 
     except Exception as e:
-        logger.error(f"Erreur dans main: {e}")
+        logger.error(f"Erreur principale: {e}")
         import traceback
         logger.error(traceback.format_exc())
-    finally:
-        if client.is_connected():
-            await client.disconnect()
 
-if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot arrêté par l'utilisateur")
-    except Exception as e:
-        logger.error(f"Erreur fatale: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-    
+if __name__ == "__main__":
+    asyncio.run(main())
