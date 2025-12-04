@@ -52,11 +52,12 @@ current_game_number = 0
 source_channel_ok = False
 prediction_channel_ok = False
 transfer_enabled = True
+# NOUVEAU: Offsets de configuration persistants
 A_OFFSET = A_OFFSET_DEFAULT
 R_OFFSET = R_OFFSET_DEFAULT
 CONFIG_FILE = 'bot_config.json'
 
-# --- Fonctions de Persistance ---
+# --- NOUVEAU: Fonctions de Persistance ---
 
 def load_config():
     """Charge la configuration depuis le fichier JSON."""
@@ -153,6 +154,15 @@ def extract_first_card_details(group_str: str):
         return value, suit
     return None, None
 
+def get_first_suit_in_group(group_str: str) -> str:
+    """Trouve la première couleur (suit) dans un groupe. (GARDÉE mais non utilisée par la nouvelle logique)"""
+    suit_pattern = r'[♠♥♦♣]|♠️|♥️|♦️|♣️|❤️|❤'
+    match = re.search(suit_pattern, group_str)
+    if match:
+        return normalize_suit(match.group())
+    return None
+
+# --- REMPLACEMENT DE LA LOGIQUE get_predicted_suit ---
 def get_predicted_suit(base_suit: str, card_value: str, game_number: int) -> str:
     """
     Applique la transformation selon la nouvelle règle complexe:
@@ -166,10 +176,10 @@ def get_predicted_suit(base_suit: str, card_value: str, game_number: int) -> str
     # Si la valeur n'est pas trouvée, on suppose IMPAIRE pour éviter de casser la logique
     is_value_odd = is_card_value_odd(card_value) if card_value else True 
     
-    H = '♥' # Coeur
-    S = '♠' # Pique
-    D = '♦' # Carreau
-    C = '♣' # Trèfle
+    H = '♥' # Coeur (❤️)
+    S = '♠' # Pique (♠️)
+    D = '♦' # Carreau (♦️)
+    C = '♣' # Trèfle (♣️)
     
     # --- Jeux PAIRS (is_odd_game est False) ---
     if not is_odd_game:
@@ -240,8 +250,8 @@ async def send_prediction_to_channel(target_game: int, predicted_suit: str, base
             'base_game': base_game,
             'base_suit': base_suit,
             'status': '⏳',
-            'r_offset': R_OFFSET,
-            'verification_attempt': 0,
+            'r_offset': R_OFFSET, # NOUVEAU: Stocke l'offset R de vérification
+            'verification_attempt': 0, # NOUVEAU: Compteur d'essais
             'created_at': datetime.now().isoformat()
         }
 
@@ -267,24 +277,20 @@ async def update_prediction_status(game_number: int, new_status: str, verificati
         if verification_game_number is not None:
              verification_index = verification_game_number - game_number
 
-        # --- CODE MODIFIÉ POUR LA SIMPLIFICATION DU MESSAGE DE STATUT ---
         if new_status == '✅':
-            # Utilise l'emoji basé sur l'index de vérification (ex: ✅0️⃣, ✅1️⃣)
+            # Utilise l'emoji basé sur l'index de vérification
             status_emoji = VERIFICATION_EMOJIS.get(verification_index, '✅')
             
-            # Message de statut simplifié
+            # Message de statut SIMPLIFIÉ
             updated_msg = f"📲Game:{game_number}:{display_suit} statut :{status_emoji}"
             
-            logger.info(f"✅ Prédiction #{game_number} mise à jour: {new_status} (Essai N+{verification_index})")
         else:
             updated_msg = f"📲Game:{game_number}:{display_suit} statut :{new_status}"
-            logger.info(f"❌ Prédiction #{game_number} mise à jour: {new_status}")
-        # --- FIN DE LA MODIFICATION ---
-
 
         if PREDICTION_CHANNEL_ID and pred['message_id'] > 0 and prediction_channel_ok:
             try:
                 await client.edit_message(PREDICTION_CHANNEL_ID, pred['message_id'], updated_msg)
+                logger.info(f"✅ Prédiction #{game_number} mise à jour: {new_status} (Essai N+{verification_index})")
             except Exception as e:
                 logger.error(f"❌ Erreur mise à jour dans le canal: {e}")
 
@@ -414,6 +420,7 @@ async def process_verification(message_text: str):
                 else:
                     # ÉCHEC (Essai non final), on incrémente le compteur pour le prochain jeu
                     pred['verification_attempt'] += 1
+                    # Note: On ne met pas à jour le statut du message ici, on attend soit le succès, soit l'échec final.
                     logger.info(f"⏳ Jeu #{current_game_number}: {SUIT_DISPLAY.get(target_suit, target_suit)} non trouvé. Continue vérification pour #{pred_game_number} (Essai: {pred['verification_attempt']})")
 
     except Exception as e:
@@ -501,7 +508,7 @@ async def schedule_periodic_reset():
 
 async def schedule_daily_reset():
     """Reset quotidien à 00h59 WAT (UTC+1)."""
-    wat_tz = timezone(timedelta(hours=1)) # Heure du Bénin (WAT = UTC+1)
+    wat_tz = timezone(timedelta(hours=1))
     
     while True:
         now = datetime.now(wat_tz)
@@ -511,7 +518,7 @@ async def schedule_daily_reset():
             reset_time += timedelta(days=1)
         
         wait_seconds = (reset_time - now).total_seconds()
-        logger.info(f"⏰ Prochain reset quotidien à 00h59 WAT dans {wait_seconds/3600:.1f} heures")
+        logger.info(f"⏰ Prochain reset quotidien dans {wait_seconds/3600:.1f} heures")
         
         await asyncio.sleep(wait_seconds)
         
@@ -592,6 +599,9 @@ async def cmd_debug(event):
 **État:**
 • Jeu actuel: #{current_game_number}
 • Prédictions actives: {len(pending_predictions)}
+
+**Règles de transformation (Mise à jour):**
+• Dépend de la parité du Jeu (N) ET de la parité de la carte (Paire/Impaire) du 2ème groupe.
 
 **Reset automatique:**
 • Toutes les 2 heures
@@ -748,15 +758,14 @@ API_HASH = os.getenv('API_HASH') or ''
 BOT_TOKEN = os.getenv('BOT_TOKEN') or ''
 PORT = int(os.getenv('PORT') or '10000')
 
-# MAPPINGS OBSOLETES (main.py utilise une logique complexe)
-SUIT_MAPPING_EVEN = {'♠': '♣', '♣': '♠', '♦': '♥', '♥': '♦'} 
+SUIT_MAPPING_EVEN = {'♠': '♣', '♣': '♠', '♦': '♥', '♥': '♦'}
 SUIT_MAPPING_ODD = {'♠': '♥', '♣': '♦', '♦': '♣', '♥': '♠'}
-
 ALL_SUITS = ['♥', '♠', '♦', '♣']
 SUIT_DISPLAY = {'♠': '♠️', '♥': '❤️', '♦': '♦️', '♣': '♣️'}
 SUIT_NORMALIZE = {'❤️': '♥', '❤': '♥', '♥️': '♥', '♠️': '♠', '♦️': '♦', '♣️': '♣'}
 
-# --- CONFIGURATIONS PERSISTANTES ---
+# --- NOUVELLES CONFIGURATIONS ---
+
 A_OFFSET_DEFAULT = 1
 R_OFFSET_DEFAULT = 0
 
@@ -777,7 +786,11 @@ VERIFICATION_EMOJIS = {
         with open(os.path.join(deploy_dir, 'config.py'), 'w', encoding='utf-8') as f:
             f.write(config_content)
 
-        # Copie de main.py
+        # Copie de main.py (utilise le contenu mis à jour)
+        # Note: Cette partie du code de la commande /deploy utilise le fichier main.py qui est
+        # le code en cours d'exécution. Nous devons nous assurer que le fichier main.py
+        # dans le ZIP contient la nouvelle logique. Comme le script actuel
+        # EST la nouvelle logique, on utilise son contenu.
         with open('main.py', 'r', encoding='utf-8') as f:
             main_content = f.read()
         with open(os.path.join(deploy_dir, 'main.py'), 'w', encoding='utf-8') as f:
@@ -842,7 +855,7 @@ openpyxl==3.1.2
 - `/r [valeur]`: Nombre d'essais de vérification (N+0 à N+R_OFFSET)
 
 **Prédiction (immédiate):**
-- Lit la première carte (Valeur et Couleur) du 2ème groupe
+- Lit la 1ère carte (Valeur et Couleur) du 2ème groupe.
 - Applique la nouvelle transformation complexe dépendante de la **parité du jeu** et de la **parité de la carte (Paire/Impaire)**.
 - Prédit pour le jeu **N + A_OFFSET**
 
